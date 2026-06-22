@@ -263,7 +263,9 @@ def cmd_up(a) -> None:
         "gpu": best["gpu_name"], "num_gpus": best.get("num_gpus", a.gpus),
         "cpu_cores": int(best.get("cpu_cores_effective") or best.get("cpu_cores", 0)),
         "created_at": now, "deadline": now + a.hours * 3600,
-        "time_budget_s": int(getattr(a, "minutes", 5) * 60),  # per-experiment training budget
+        "time_budget_s": int(getattr(a, "minutes", 5) * 60),  # per-experiment compute budget
+        "metric": getattr(a, "metric", PRIMARY_METRIC_DEFAULT),  # objective name (domain-agnostic)
+        "goal": getattr(a, "goal", "min"),                       # "min" or "max"
         "host": None, "port": None, "ready": False, "remote_py": DEFAULT_REMOTE_PY,
     })
     print(f"created instance {iid} at ${best['dph_total']:.3f}/hr "
@@ -322,7 +324,8 @@ def cmd_status(a) -> None:
     up_h = (time.time() - s["created_at"]) / 3600
     print(f"instance {s['instance_id']}  {s['num_gpus']}x {s['gpu']}  "
           f"${s['dph']:.3f}/hr  cpu_cores={s.get('cpu_cores', '?')}  "
-          f"exp_budget={s.get('time_budget_s', 300)//60}min")
+          f"exp_budget={s.get('time_budget_s', 300)//60}min  "
+          f"objective={s.get('metric', PRIMARY_METRIC_DEFAULT)}({s.get('goal', 'min')})")
     print(f"  status: {info.get('actual_status') if isinstance(info, dict) else '?'}")
     print(f"  uptime: {up_h:.2f}h   est. cost so far: ${up_h * s['dph']:.2f}")
     print(f"  deadline in: {(s['deadline'] - time.time()) / 3600:.2f}h")
@@ -381,7 +384,7 @@ fi
 echo "REMOTE_PY=$PY"
 
 echo "=== FA3 kernel smoke (validates the torch<->kernel match; small download) ==="
-"$PY" -c "import torch; from kernels import get_kernel; cap=torch.cuda.get_device_capability(); repo='varunneal/flash-attention-3' if cap==(9,0) else 'kernels-community/flash-attn3'; get_kernel(repo).flash_attn_interface; print('FA3 OK from', repo)"
+"$PY" -c "import torch; from kernels import get_kernel; cap=torch.cuda.get_device_capability(); repo='varunneal/flash-attention-3' if cap==(9,0) else 'kernels-community/flash-attn3'; get_kernel(repo, revision='main').flash_attn_interface; print('FA3 OK from', repo)"
 
 echo "=== prepare.py (download shards + train tokenizer; idempotent, cached) ==="
 "$PY" prepare.py --num-shards {NUM_SHARDS}
@@ -430,16 +433,22 @@ def cmd_setup(a) -> None:
 
 # --- experiment run ------------------------------------------------------------
 
-METRIC_KEYS = ("val_bpb", "training_seconds", "total_seconds", "peak_vram_mb",
-               "mfu_percent", "total_tokens_M", "num_steps", "num_params_M", "depth")
+# The default (LLM) objective. Override per session with `start --metric NAME --goal min|max`.
+# The experiment just has to print a "NAME: <number>" summary line; nothing here is
+# LLM-specific, so re-targeting the research to another domain needs no change in this file.
+PRIMARY_METRIC_DEFAULT = "val_bpb"
+METRIC_LINE_RE = r"^([A-Za-z_][A-Za-z0-9_]*):[ \t]*(-?[0-9.]+)[ \t]*$"
 
 
 def parse_metrics(text: str) -> dict:
+    """Parse EVERY `name: number` summary line the experiment prints (domain-agnostic) —
+    so whatever objective + diagnostics a re-targeted experiment emits are all captured."""
     out = {}
-    for k in METRIC_KEYS:
-        m = re.search(rf"^{k}:\s*([\d.]+)\s*$", text, re.MULTILINE)
-        if m:
-            out[k] = float(m.group(1))
+    for k, v in re.findall(METRIC_LINE_RE, text, re.MULTILINE):
+        try:
+            out[k] = float(v)
+        except ValueError:
+            pass
     return out
 
 
@@ -482,30 +491,35 @@ def cmd_exp(a) -> None:
     scp_to(s, str(train), f"{workdir}/train.py")
     log = f"{workdir}/run.log"
     inv = _train_invocation(s, slot, f"{workdir}/train.py", cache)
-    # Reap any GHOST run still holding this slot's GPU before starting (clears leftovers
-    # from a died subagent). The run itself is NOT force-killed — train.py self-stops at
-    # TIME_BUDGET, so a healthy run ends on its own.
-    remote = (f'pkill -9 -f "{workdir}/train.py" 2>/dev/null; sleep 1; '
-              f"{inv} > {log} 2>&1; "
-              f"grep -E '^({'|'.join(METRIC_KEYS)}):' {log} || "
+    # Reap any GHOST run still holding this slot's GPU, in a SEPARATE ssh call. The reap and
+    # the run must NOT share a shell: pkill -f matches the *whole* command line, so if the
+    # reap ran in the same shell as the train.py invocation it would SIGKILL its own wrapper
+    # shell before python launched. The `[t]rain.py` regex class matches real `train.py`
+    # processes but keeps the literal "train.py" out of pkill's own command line, so it can't
+    # self-match. The run itself is NOT force-killed — train.py self-stops at the budget.
+    ssh_run(s, f'pkill -9 -f "{workdir}/[t]rain.py" 2>/dev/null; sleep 1; true')
+    # Capture EVERY `name: number` summary line (domain-agnostic), then pick the objective.
+    remote = (f"{inv} > {log} 2>&1; "
+              f"grep -E '^[A-Za-z_][A-Za-z0-9_]*:[ \\t]*-?[0-9.]+[ \\t]*$' {log} || "
               f"(echo '--- CRASH (tail) ---'; tail -n 40 {log})")
-    print(f"[slot{slot}/gpu{slot}] running train.py (cores {slot_cores(s, slot)[1]})…",
+    print(f"[slot{slot}/gpu{slot}] running experiment (cores {slot_cores(s, slot)[1]})…",
           flush=True)
     t0 = time.time()
     r = ssh_run(s, remote)
     dt = time.time() - t0
     m = parse_metrics(r.stdout)
+    primary = s.get("metric", PRIMARY_METRIC_DEFAULT)
     oom = "out of memory" in r.stdout.lower() or "outofmemory" in r.stdout.lower()
-    if "val_bpb" in m:
-        result = {"slot": slot, "ok": True, "wall_seconds": round(dt, 1), **m}
-        print(f"[slot{slot}] val_bpb={m['val_bpb']:.6f}  "
-              f"vram={m.get('peak_vram_mb', 0)/1024:.1f}GB  "
-              f"steps={int(m.get('num_steps', 0))}  wall={dt:.0f}s")
+    if primary in m:
+        result = {"slot": slot, "ok": True, "metric": primary, "score": m[primary],
+                  "wall_seconds": round(dt, 1), **m}
+        extra = f"  vram={m['peak_vram_mb']/1024:.1f}GB" if "peak_vram_mb" in m else ""
+        print(f"[slot{slot}] {primary}={m[primary]:.6f}{extra}  wall={dt:.0f}s")
     else:
         reason = "OOM" if oom else "CRASH"
         result = {"slot": slot, "ok": False, "reason": reason, "wall_seconds": round(dt, 1)}
-        hint = "  (lower DEVICE_BATCH_SIZE / model size; treat as discard)" if oom else ""
-        print(f"[slot{slot}] {reason} / no val_bpb{hint}. tail:\n{r.stdout[-1500:]}")
+        hint = "  (out of memory — shrink the run; treat as discard)" if oom else ""
+        print(f"[slot{slot}] {reason} / no '{primary}'{hint}. tail:\n{r.stdout[-1500:]}")
     print("RESULT_JSON:" + json.dumps(result))
     sys.exit(0 if result["ok"] else 1)
 
@@ -605,7 +619,7 @@ def _read_results() -> list[dict]:
         if not line.strip() or line.startswith("commit\t"):
             continue
         p = (line.split("\t") + [""] * 6)[:6]
-        rows.append(dict(zip(("commit", "val_bpb", "memory_gb", "status", "branch", "description"), p)))
+        rows.append(dict(zip(("commit", "score", "memory_gb", "status", "branch", "description"), p)))
     return rows
 
 
@@ -616,14 +630,15 @@ def _fval(x) -> float | None:
         return None
 
 
-def _svg_chart(rows: list[dict], w: int = 920, h: int = 340) -> str:
-    """Inline SVG (no JS/CDN): val_bpb per experiment, colored by status, with a
-    green 'best so far' line. Lower is better, so improvement trends downward."""
-    # Keep only plotted points (valid val_bpb, not a crash). Index by POSITION among the
-    # plotted points (j), NOT the original row index — otherwise filtering a crash/discard
-    # pushes later points off the right edge and the chart looks blank.
+def _svg_chart(rows: list[dict], metric: str = "val_bpb", goal: str = "min",
+               w: int = 920, h: int = 340) -> str:
+    """Inline SVG (no JS/CDN): the objective per experiment, colored by status, with a
+    'best so far' line. Domain-agnostic — works for any metric name + direction."""
+    # Plot non-crash rows with a numeric score (scores may be 0 or negative for some
+    # domains). Index by POSITION among plotted points (j) so filtering a crash/discard
+    # doesn't push later points off the right edge (which would look blank).
     pts = [(v, r["status"]) for r in rows
-           if (v := _fval(r["val_bpb"])) and v > 0 and r["status"] != "crash"]
+           if r["status"] != "crash" and (v := _fval(r.get("score"))) is not None]
     if not pts:
         return "<p class=muted>No completed experiments yet — the chart fills in as results log.</p>"
     pl, pr, pt, pb = 64, 18, 18, 34
@@ -633,8 +648,9 @@ def _svg_chart(rows: list[dict], w: int = 920, h: int = 340) -> str:
     if ymax - ymin < 1e-9:
         ymin, ymax = ymin - 0.01, ymax + 0.01
     n = len(pts)
+    better = min if goal == "min" else max
     fx = lambda j: pl + (j / (n - 1) * pw if n > 1 else pw / 2)  # j = position among plotted
-    fy = lambda v: pt + (ymax - v) / (ymax - ymin) * ph          # low val -> low on screen
+    fy = lambda v: pt + (ymax - v) / (ymax - ymin) * ph          # higher value -> higher up
 
     parts = [f'<svg viewBox="0 0 {w} {h}" width="100%" preserveAspectRatio="xMidYMid meet">']
     parts.append(f'<rect x="0" y="0" width="{w}" height="{h}" fill="#0f1419" rx="8"/>')
@@ -643,11 +659,11 @@ def _svg_chart(rows: list[dict], w: int = 920, h: int = 340) -> str:
         v = ymax - k / 4 * (ymax - ymin)
         y = pt + k / 4 * ph
         parts.append(f'<line x1="{pl}" y1="{y:.1f}" x2="{w-pr}" y2="{y:.1f}" stroke="#1f2937"/>')
-        parts.append(f'<text x="{pl-8}" y="{y+4:.1f}" fill="#6b7280" font-size="11" text-anchor="end">{v:.4f}</text>')
-    # best-so-far line (running min)
-    best, bpath = float("inf"), []
+        parts.append(f'<text x="{pl-8}" y="{y+4:.1f}" fill="#6b7280" font-size="11" text-anchor="end">{v:.4g}</text>')
+    # best-so-far line (running best per goal: min for lower-is-better, else max)
+    best, bpath = None, []
     for j, (v, _) in enumerate(pts):
-        best = min(best, v)
+        best = v if best is None else better(best, v)
         bpath.append(f"{fx(j):.1f},{fy(best):.1f}")
     parts.append(f'<polyline points="{" ".join(bpath)}" fill="none" stroke="#34d399" stroke-width="2"/>')
     # points
@@ -655,7 +671,7 @@ def _svg_chart(rows: list[dict], w: int = 920, h: int = 340) -> str:
         c = {"keep": "#34d399", "discard": "#6b7280"}.get(st, "#f59e0b")
         parts.append(f'<circle cx="{fx(j):.1f}" cy="{fy(v):.1f}" r="3.4" fill="{c}"/>')
     parts.append(f'<text x="{pl}" y="{h-10}" fill="#6b7280" font-size="11">experiments → ({n} plotted)</text>')
-    parts.append(f'<text x="{w-pr}" y="{h-10}" fill="#34d399" font-size="11" text-anchor="end">best {min(vals):.6f}</text>')
+    parts.append(f'<text x="{w-pr}" y="{h-10}" fill="#34d399" font-size="11" text-anchor="end">best {html.escape(metric)} {better(vals):g}</text>')
     parts.append("</svg>")
     return "".join(parts)
 
@@ -680,14 +696,14 @@ def _box_panel(s: dict | None) -> str:
     return f'<div class=card><div class=chips>{" ".join(f"<span>{c}</span>" for c in chips)}</div>{bar}</div>'
 
 
-def _stats_panel(rows: list[dict]) -> str:
+def _stats_panel(rows: list[dict], metric: str = "val_bpb", goal: str = "min") -> str:
     keeps = [r for r in rows if r["status"] == "keep"]
     disc = sum(1 for r in rows if r["status"] == "discard")
     crash = sum(1 for r in rows if r["status"] == "crash")
-    valid = [v for v in (_fval(r["val_bpb"]) for r in keeps) if v and v > 0]
-    best = min(valid) if valid else None
+    valid = [v for v in (_fval(r.get("score")) for r in keeps) if v is not None]
+    best = (min if goal == "min" else max)(valid) if valid else None
     cells = [("experiments", len(rows)), ("keeps", len(keeps)), ("discards", disc),
-             ("crashes", crash), ("best val_bpb", f"{best:.6f}" if best else "—")]
+             ("crashes", crash), (f"best {metric}", f"{best:g}" if best is not None else "—")]
     return '<div class=stats>' + "".join(
         f'<div><div class=k>{html.escape(str(v))}</div><div class=muted>{lbl}</div></div>'
         for lbl, v in cells) + '</div>'
@@ -723,7 +739,7 @@ code{background:#0f1419;padding:1px 6px;border-radius:4px}a{color:#34d399}
 </style></head><body>
 <h1>autoresearch <span class=sub>● live · refreshes every 5s</span></h1>
 $box$stats
-<div class=card><h2>val_bpb over experiments (lower = better)</h2>$chart</div>
+<div class=card><h2>$metrictitle</h2>$chart</div>
 <div class=grid>
 <div class=card><h2>Leaderboard (best keeps)</h2>$leaderboard</div>
 <div class=card><h2>Recent</h2>$recent</div></div>
@@ -733,19 +749,22 @@ $box$stats
 
 def _render_page() -> str:
     rows = _read_results()
-    state = load_state()
-    keeps = sorted((r for r in rows if r["status"] == "keep" and (_fval(r["val_bpb"]) or 0) > 0),
-                   key=lambda r: _fval(r["val_bpb"]))
-    cols = [("val_bpb", "val_bpb"), ("slot", "branch"), ("mem", "memory_gb"),
+    state = load_state() or {}
+    metric = state.get("metric", PRIMARY_METRIC_DEFAULT)
+    goal = state.get("goal", "min")
+    valid_keeps = [r for r in rows if r["status"] == "keep" and _fval(r.get("score")) is not None]
+    keeps = sorted(valid_keeps, key=lambda r: _fval(r["score"]), reverse=(goal == "max"))
+    cols = [(metric, "score"), ("slot", "branch"), ("mem", "memory_gb"),
             ("commit", "commit"), ("description", "description")]
     findings = (REPO / "findings.md").read_text()[-4000:] if (REPO / "findings.md").exists() else "(no findings.md yet)"
     return PAGE.safe_substitute(
-        box=_box_panel(state),
-        stats=f'<div class=card>{_stats_panel(rows)}</div>',
-        chart=_svg_chart(rows),
+        box=_box_panel(load_state()),
+        stats=f'<div class=card>{_stats_panel(rows, metric, goal)}</div>',
+        chart=_svg_chart(rows, metric, goal),
+        metrictitle=f"{html.escape(metric)} over experiments ({'lower' if goal == 'min' else 'higher'} = better)",
         leaderboard=_table(keeps[:10], cols) or "<p class=muted>none yet</p>",
         recent=_table(list(reversed(rows))[:14],
-                      [("val_bpb", "val_bpb"), ("status", "status"), ("slot", "branch"),
+                      [(metric, "score"), ("status", "status"), ("slot", "branch"),
                        ("description", "description")]),
         findings=html.escape(findings),
     )
@@ -786,12 +805,14 @@ def cmd_reap(a) -> None:
     """Kill stray train.py runs on the box (ghost runs from died/abandoned subagents)
     and show what's still on the GPUs. Run between rounds, or with --slot to clear one."""
     s = require_state()
+    # `[t]rain.py` matches real train.py processes but keeps the literal "train.py" out of
+    # pkill's own command line, so it never SIGKILLs its own wrapper shell (see cmd_exp).
     if a.slot is not None:
-        ssh_run(s, f'pkill -9 -f "{REMOTE_DIR}/slots/slot{a.slot}/train.py" 2>/dev/null')
+        ssh_run(s, f'pkill -9 -f "{REMOTE_DIR}/slots/slot{a.slot}/[t]rain.py" 2>/dev/null; true')
         print(f"reaped any run on slot{a.slot}")
     else:
-        ssh_run(s, f'pkill -9 -f "{REMOTE_DIR}/slots/.*train\\.py" 2>/dev/null; '
-                   f'pkill -9 -f "{REMOTE_DIR}/train.py" 2>/dev/null')
+        ssh_run(s, f'pkill -9 -f "{REMOTE_DIR}/slots/.*[t]rain\\.py" 2>/dev/null; '
+                   f'pkill -9 -f "{REMOTE_DIR}/[t]rain.py" 2>/dev/null; true')
         print("reaped all stray train.py runs")
     out = ssh_run(s, "nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory "
                      "--format=csv,noheader 2>/dev/null").stdout.strip()
@@ -815,7 +836,7 @@ def cmd_log(a) -> None:
     import fcntl
     row = "\t".join(a.fields)
     if not RESULTS.exists():
-        RESULTS.write_text("commit\tval_bpb\tmemory_gb\tstatus\tbranch\tdescription\n")
+        RESULTS.write_text("commit\tscore\tmemory_gb\tstatus\tbranch\tdescription\n")
     with open(RESULTS, "a") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         f.write(row + "\n")
@@ -896,7 +917,11 @@ def main() -> None:
         if full:
             p.add_argument("--hours", type=float, default=3.0, help="session length (auto-destroy)")
             p.add_argument("--minutes", type=float, default=5.0,
-                           help="per-experiment training budget, minutes (variable per session)")
+                           help="per-experiment compute budget, minutes (variable per session)")
+            p.add_argument("--metric", default=PRIMARY_METRIC_DEFAULT,
+                           help="objective name the experiment prints (default: val_bpb)")
+            p.add_argument("--goal", choices=("min", "max"), default="min",
+                           help="optimize the metric to min (default) or max")
             p.add_argument("--disk", type=int, default=80)
             p.add_argument("--image", default=None, help="raw docker image (default: Vast PyTorch template)")
             p.add_argument("--offer-id", type=int, default=None, help="rent this exact offer id")

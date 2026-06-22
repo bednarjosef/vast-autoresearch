@@ -1,13 +1,20 @@
 # autoresearch
 
-An autonomous LLM-training research swarm you drive from a laptop with **no local GPU**.
-You tell it what to optimize; it rents a multi-GPU box on [Vast.ai](https://vast.ai), spawns
-a pool of AI subagents that edit `train.py` in parallel — each on its own GPU — and compounds
-their wins into a steadily-improving model. Findings are grounded in the literature via the
+An autonomous research swarm you drive from a laptop with **no local GPU**. You tell it what
+to optimize; it rents a multi-GPU box on [Vast.ai](https://vast.ai), spawns a pool of AI
+subagents that mutate one **experiment** file in parallel — each on its own GPU — and compounds
+their wins into a steadily-improving result. Findings are grounded in the literature via the
 `research` skill, progress is visible in a live dashboard, and the box tears itself down at a
 hard deadline so you can leave it running overnight.
 
-The training core is a single-file GPT (Muon + AdamW), forked from
+**It can research almost anything.** The repo ships configured for **LLM pretraining** (the
+*experiment* is `train.py`, the *harness* is `prepare.py`, the *objective* is `val_bpb`) — but
+on a fresh clone the agent **onboards you and reshapes it to your goal**: any task where one
+artifact can be mutated and scored by a frozen evaluator (an algorithm, a kernel, a solver, a
+prompt, a strategy…). Set the objective + direction with `vast.py start --metric NAME --goal
+min|max`; the whole orchestration engine is the same regardless of domain.
+
+The default training core is a single-file GPT (Muon + AdamW), forked from
 [nanochat](https://github.com/karpathy/nanochat) / [autoresearch](https://github.com/karpathy/nanochat).
 
 ---

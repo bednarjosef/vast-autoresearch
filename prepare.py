@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import math
+import signal
 import argparse
 import pickle
 from multiprocessing import Pool
@@ -366,6 +367,32 @@ def evaluate_bpb(model, tokenizer, batch_size):
         total_nats += (loss_flat * mask).sum().item()
         total_bytes += nbytes.sum().item()
     return total_nats / (math.log(2) * total_bytes)
+
+# ---------------------------------------------------------------------------
+# Hard training-time deadline (DO NOT CHANGE — keeps the per-experiment limit honest)
+# ---------------------------------------------------------------------------
+# train.py self-stops via its per-step time check, but that can drift (a slow step, an
+# uncounted warm-up, or a hang). This arms a real wall-clock alarm: when it fires, SIGALRM
+# raises TrainingTimeUp in the main thread, so training stops *promptly and gracefully* —
+# train.py catches it and still runs the final eval, so you always get a val_bpb.
+
+class TrainingTimeUp(Exception):
+    """Raised in the main thread when the hard training-time deadline fires."""
+
+def start_training_clock(grace_seconds=30):
+    """Arm a HARD wall-clock cap on the training phase. Call right before the training loop.
+    Fires at TIME_BUDGET + grace from now; the grace covers the uncounted warm-up steps so a
+    healthy run still stops via its own per-step check first, and the alarm only bites on
+    overruns/hangs. Wrap the loop in `try: ... except TrainingTimeUp: pass`, then eval."""
+    def _on_deadline(signum, frame):
+        raise TrainingTimeUp()
+    signal.signal(signal.SIGALRM, _on_deadline)
+    signal.setitimer(signal.ITIMER_REAL, max(1.0, TIME_BUDGET + grace_seconds))
+
+def stop_training_clock():
+    """Disarm the deadline. Call after the loop, before eval, so the alarm can't interrupt
+    evaluation."""
+    signal.setitimer(signal.ITIMER_REAL, 0.0)
 
 # ---------------------------------------------------------------------------
 # Main

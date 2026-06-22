@@ -15,6 +15,15 @@ machine runs.** Read `program.md` first (the mission + config), then run the loo
 The control plane is one file: **`vast.py`** (`python vast.py --help`). It rents/destroys
 the box, prepares it, benchmarks the GPUs, and runs one experiment on a chosen GPU slot.
 
+> **This engine is domain-agnostic.** The examples below use the default LLM-pretraining
+> vocabulary; read these terms as their general roles, whatever `program.md` actually configures:
+> **`train.py`** = the *experiment* (the artifact subagents edit), **`prepare.py`** = the *frozen
+> harness/evaluator*, **`val_bpb`** = the *objective* the experiment prints, and the box's
+> **GPUs** = the *parallel compute slots*. "Lower `val_bpb` is better" is the default direction;
+> if `program.md`/`vast.py start` set **`--goal max`**, flip every "lower/improved" comparison to
+> "higher". Everything else — N parallel slots, disjoint axes, compounding, the research scout,
+> the safety model — is identical for any research target.
+
 ---
 
 ## Roles — and the two rules that are non-negotiable
@@ -100,21 +109,37 @@ itself.
 - **1 each** for tight steering (early calibration, risky ideas, or little time left).
 - **2 each** to go deeper on a promising axis (idea + a natural follow-up in one dispatch).
 
-> **USE THE `research` SKILL — every round, not from memory.** Before assigning directions,
-> mine the literature with the **`research` skill** (scholarly + web): find genuinely **novel
-> ideas**, the **current SOTA** for whatever you're optimizing, and evidence on whether an idea
-> is known to work or to fail (so you don't burn a GPU rediscovering it). Ground each slot's
-> direction in what you find. **Triage abstracts first** (the skill's `--abstracts --json`
-> mode) to scan many ideas cheaply, then fetch full text only for the most promising. **Because
-> the foreground batch blocks you, you can't run the skill yourself while waiting — so EVERY
-> round you MUST include a research-scout subagent in the batch** to do it concurrently
-> (step 4); you may also research between rounds, when you're unblocked. Lean on the skill hard
-> — it is your primary source of ideas, not your prior knowledge.
+> **SWING FOR BIG WINS — bold and novel over tiny and safe.** Spend most slots on ideas with
+> **large upside**: new mechanisms, **structural/architectural** changes, fundamentally
+> different approaches — the things that can move the metric *a lot*. Micro-tuning (nudging a
+> hyperparameter, ±0.001 chasing) is **secondary**: do it sparingly, and when you do, batch it
+> as a single parallel sweep rather than spending a whole round on it. A bold idea that fails is
+> fine and expected; a session of timid tweaks is the real failure mode. Prefer high-risk /
+> high-reward, and keep at least one slot each round on something genuinely new or ambitious.
+
+> **USE THE `research` SKILL — and REASON HARD — every round, not from memory.** Your ideas come
+> from active research + creative reasoning, not recall. Every round: **brainstorm widely** —
+> generate a large, *diverse* pool of candidate ideas (including bold, structural, and
+> cross-disciplinary ones), then **mine the literature** with the **`research` skill** (scholarly
+> + web) for **current SOTA**, genuinely **novel ideas**, and evidence on what's known to work or
+> fail (so you don't burn a GPU rediscovering it). **Triage abstracts first** (`--abstracts
+> --json`) to scan many cheaply, then fetch full text for the most promising. Rank candidates by
+> **potential upside**, favor the ambitious ones, and ground each slot's direction in what you
+> find. **Because the foreground batch blocks you, you can't run the skill yourself while waiting
+> — so EVERY round you MUST include a research-scout subagent in the batch** to do this
+> concurrently (step 4); you may also reason/research between rounds, when you're unblocked.
+
+**The loop is a RATCHET.** The champion branch only ever moves to a strictly better score:
+every confirmed win is merged in, the result is re-tested, and the next round builds on top.
+Improvements accumulate and never slip back — like the single-branch keep/reset ratchet in the
+original autoresearch, but with N parallel slots whose wins are merged into one champion.
 
 Each round, in order:
 
-1. **Pick the champion** = lowest `val_bpb` so far (its `train.py` is on `autoresearch/<tag>`).
-   Every subagent starts from it.
+1. **Pick the champion** = the best score so far; its `train.py` is the branch
+   `autoresearch/<tag>`. **Reset every slot branch to the champion** so each slot starts from an
+   identical, clean base and its commit is a single clean diff to merge back later:
+   `git -C worktrees/slot{i} reset --hard autoresearch/<tag>` for each slot.
 
 2. **Assign each slot a DISJOINT axis — non-overlap is a HARD RULE.** Use the axes defined
    in `program.md`. Each idea belongs to exactly one axis, so distinct axes cannot collide.
@@ -151,10 +176,15 @@ Each round, in order:
    **Never background the subagents or poll for them.**
    - **The research-scout is REQUIRED every round — it is how research happens during the GPU
      window.** Because the foreground batch blocks you until it returns, you *cannot* run the
-     `research` skill yourself while waiting. So the scout does it concurrently: task it to run
-     the **`research` skill** on the round's open question (triage abstracts first, fetch the
-     best), and return novel ideas + SOTA + what's known to work/fail. Its findings come back
-     **with** the experiment results, ready to shape the next round.
+     `research` skill yourself while waiting. So the scout does it concurrently. Task it to be a
+     **creative idea engine, not just a paper-fetcher**: (a) **reason and brainstorm hard** — produce
+     a *large, diverse* pool of candidate ideas, deliberately including **bold, structural, even
+     unconventional / cross-disciplinary** ones, not just incremental tweaks; (b) **mine the
+     literature** with the **`research` skill** (triage abstracts first, fetch the best) for SOTA
+     and evidence; then (c) **rank everything by potential upside** and flag the few highest-swing
+     bets. Give it a meaty prompt (the champion, what's been Tried/Banked, the open question) and
+     ask for *many* ideas, the more creative the better. Its findings come back **with** the
+     experiment results, ready to shape the next round.
    - You may *also* think/research directly **between rounds** (after the batch returns, before
      the next dispatch) — that's the only time you're unblocked. Just never via a
      background/poll loop. Fold everything (scout + your own reading) into the next round's
@@ -177,18 +207,29 @@ Each round, in order:
      its hyperparameter — a single sweep on one slot — after which the value is frozen.
      Re-spending slots to "perfect" a banked idea (sweeping its value, per-token/per-seq
      variants, etc.) is the #1 way the loop stalls. Keep what worked; go find the NEXT new win.
-   - **Compound: find A, find B, then TEST A+B and adopt the best as the new base.** When two
-     (or more) confirmed wins land — especially on different axes, which usually compose —
-     build the combination on top of the champion and **run it** (`exp` on the merged
-     `train.py`). If the combo beats every part, *it* becomes the new champion and the next
-     round builds on the combo. If the combo is worse than its best component (the changes
-     interact/cancel), keep the better single one and record the conflict in `findings.md`.
-     Keep folding every confirmed win in, so the champion is always "everything that's worked
-     so far," and `val_bpb` keeps dropping all session.
-   - **Build UPON, don't restart.** Every subagent starts from the current champion (which
-     already contains all stacked wins), so each experiment is "champion + one new idea" by
-     construction. Only occasionally test an idea against the bare baseline — e.g. to isolate
-     whether a stacked change is now *blocking* a bigger gain, or to ablate an interaction.
+   - **Variants of the SAME thing → merge ONLY the best.** If several slots tested different
+     values/forms of *one* knob or idea in parallel (a deliberate sweep — e.g. lr 0.02/0.03/0.04,
+     or flooding b 3/3.5/4), those results are **mutually exclusive, not composable**. Pick the
+     single best, merge only that one, and discard the rest (they're data points, not separate
+     wins). Never stack two settings of the same knob.
+   - **Merge each (genuinely disjoint) win into the champion (the ratchet tooth).** Bring each
+     winning slot's kept changes onto the champion: `git checkout autoresearch/<tag>` then
+     cherry-pick exactly what that slot added on top of the champion —
+     `git cherry-pick autoresearch/<tag>..autoresearch/<tag>-slot{i}` (the range handles a slot
+     that kept 1 *or* 2 commits this round). Because disjoint-axis slots branched from the same
+     champion, successive picks compose cleanly (a conflict means they weren't actually disjoint —
+     treat them as same-thing variants above, or resolve by hand). Do this for each disjoint
+     winner so all the round's *composable* wins stack into the champion.
+   - **Re-test the stacked champion (the pawl that stops back-slip).** After merging the round's
+     wins, run the new champion once (`exp` on the merged `train.py`) to confirm the combination
+     is *still* an improvement — occasionally two changes interact and cancel. If the stack
+     regressed below its best single component, `git reset --hard` the champion and re-apply only
+     the subset that holds; note the conflict in `findings.md`. **The champion advances only on a
+     confirmed gain** — that monotonicity is the whole point of the ratchet.
+   - **Build UPON, don't restart.** Next round, step 1 resets every slot to this new champion, so
+     each experiment is "champion + one new idea" by construction and the loop never starts from
+     scratch. Only occasionally test an idea against the bare baseline — to isolate whether a
+     stacked change is now *blocking* a bigger gain, or to ablate an interaction.
 
 6. **Reap between rounds**: `python vast.py reap` kills any stray run and confirms the GPUs
    are idle before the next dispatch (no ghosts, no leftover VRAM).
@@ -201,9 +242,10 @@ Each round, in order:
 > `worktrees/slot{i}` on branch `autoresearch/<tag>-slot{i}`. Your axis this round is
 > **{axis}** and the ONLY ideas you may try are: **{owned_ideas}** (exactly {k}). These are
 > **OFF-LIMITS** (other slots own them — never try them): **{off_limits}**. Already tried
-> (do not repeat): **{tried_digest}**. The champion is `val_bpb={champion}` — its `train.py`
-> is on branch `autoresearch/<tag>`; start from it
-> (`git -C worktrees/slot{i} checkout autoresearch/<tag> -- train.py`).
+> (do not repeat): **{tried_digest}**. The champion is `{metric}={champion}`. Your branch has
+> already been reset to the champion (a clean base), so just edit + commit — each commit is one
+> clean diff the orchestrator will cherry-pick onto the champion if it wins. Do NOT re-checkout
+> or rebase; do NOT touch the champion branch.
 >
 > Run **exactly {k} experiment(s), then STOP and return** (do NOT exceed {k} — the
 > orchestrator gives your next direction). Before each, run `python3 vast.py status`; if
@@ -218,9 +260,11 @@ Each round, in order:
 > 4. Read the printed `val_bpb` / `peak_vram`. Empty / `CRASH` / `OOM` = it failed. If
 >    `OOM`, the idea used too much VRAM — log it `crash`, `git reset --hard HEAD~1`, and
 >    DON'T retry it bigger (batch/size is Axis D's job, not yours — just report it).
-> 5. Log it to the ledger: `python vast.py log <commit> <val_bpb> <mem_gb>
+> 5. Log it to the ledger: `python vast.py log <commit> <score> <mem_gb>
 >    <keep|discard|crash> slot{i} "<description>"` (atomic; the ONLY shared file you write).
-> 6. If `val_bpb` improved, keep the commit; else `git -C worktrees/slot{i} reset --hard HEAD~1`.
+>    `<score>` is the objective value the run printed (`val_bpb` for the LLM default).
+> 6. If the score improved (per the goal direction), keep the commit; else
+>    `git -C worktrees/slot{i} reset --hard HEAD~1`.
 >
 > Do **NOT** edit `findings.md` (orchestrator-only). Stay on your slot/worktree/branch —
 > never touch another slot's GPU, worktree, or branch, and never run more than {k}
@@ -237,12 +281,15 @@ dir) yet **interconnected** (shared `results.tsv` ledger they write + orchestrat
 ## How an experiment runs (and is bounded)
 
 `vast.py exp` syncs the slot's `train.py`, pins its GPU + CPU cores, runs it, parses the
-result, and prints `val_bpb` / `RESULT_JSON`. **Each run is bounded by the training budget
-without a brutal kill:** `train.py` self-stops when its elapsed training time hits the
-budget (set per session via `vast.py`, default 5 min), so a healthy run ends on its own.
-`exp` does **not** force-kill the run; it only reaps a *ghost* still on that slot **before**
-launching (clearing a leftover from a died subagent). For a genuinely stuck run, `python
-vast.py reap` clears stray runs and shows what's on each GPU.
+result, and prints `val_bpb` / `RESULT_JSON`. **Each run is HARD-bounded by the training
+budget, gracefully — no brutal kill:** `train.py` self-stops when its elapsed training time
+hits the budget, and a frozen alarm in `prepare.py` (`start_training_clock`, SIGALRM at the
+budget + grace) is the hard backstop — when it fires, training stops *immediately* even on a
+slow/hung step, and `train.py` catches it and **still runs the final eval**, so the run
+always returns a `val_bpb` for the model trained up to that moment. The budget is set per
+session via `vast.py` (default 5 min). `exp` does **not** SIGKILL the run; it only reaps a
+*ghost* still on that slot **before** launching. For a genuinely wedged process (e.g. a stuck
+compile, which a Python-level alarm can't interrupt), `python vast.py reap` clears it.
 
 ---
 
@@ -258,8 +305,9 @@ to fit; only **Axis D** changes batch/model size. An OOM is a failure: log `cras
 ## Logging & objectivity
 
 Log every run via `python vast.py log` (file-locked; concurrency-safe), 6 tab-separated
-columns: `commit  val_bpb  memory_gb  status  branch  description` (`0000000` / `0.000000`
-/ `0.0` on failure). The fixed budget makes runs comparable; `bench` confirms the GPUs are
+columns: `commit  score  memory_gb  status  branch  description` (`score` = the objective the
+experiment printed; `0000000` / `0.000000` / `0.0` on failure). The fixed budget makes runs
+comparable; `bench` confirms the GPUs are
 equal (spread) and measures the concurrency tax; `vast.py` pins disjoint CPU cores per slot.
 When a `val_bpb` delta is small, **re-run on the same slot before crowning a champion**.
 Don't `git add` `results.tsv` or `findings.md` (untracked).

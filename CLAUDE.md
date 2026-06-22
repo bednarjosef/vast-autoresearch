@@ -1,57 +1,85 @@
 # autoresearch — session start
 
-This repo is an autonomous LLM-training research org. Two docs drive it:
+This is a general **autonomous research swarm**: an orchestrator rents a multi-GPU box and
+runs a pool of parallel subagents that mutate one **experiment artifact** to improve a
+**measured objective**, compounding wins over a session. **It can research almost anything**
+that fits a simple contract (below) — optimizing an ML model, an algorithm, a GPU kernel, a
+solver, a prompt, a trading rule, a compression scheme, a config… **LLM pretraining is just
+the default instantiation that ships in the repo** (`train.py` + `prepare.py`, objective
+`val_bpb`); it's filler to be reshaped to whatever the user wants.
+
+Two docs drive a session:
 - **`program.md`** — the **mission & config** (what to optimize, the metric, the knobs, the
-  search axes). Editable by you and the human.
-- **`ENGINE.md`** — the **fixed engine** (how the orchestrator + subagents actually run a
-  session). **Never edit `ENGINE.md`.**
+  axes). Editable by you and the human.
+- **`ENGINE.md`** — the **fixed engine** (how the orchestrator + subagents run). **Never edit it.**
+
+The roles (the LLM default in parentheses):
+- **The experiment** (`train.py`) — the one artifact the swarm edits; running it prints a
+  `OBJECTIVE: <number>` line.
+- **The harness** (`prepare.py`) — the **frozen** task/data/evaluator that computes the
+  objective honestly, so the score can't be gamed.
+- **The objective** — a metric name + direction, set via `vast.py start --metric NAME --goal min|max`.
+- **The axes** — disjoint families of edits to the experiment (so subagents never overlap).
 
 At the **start of every session**, do ONE of the following:
 
-## A) If this is a fresh clone — run onboarding FIRST
+## A) Fresh clone — run onboarding FIRST
 
-**Check `program.md` for the marker `<!-- AUTORESEARCH:UNCONFIGURED -->`.** If it's there,
-the repo hasn't been pointed at a research goal yet. Before doing anything else (even if the
-user asked something else, briefly say you'll get them set up first), **run onboarding**:
+**Check `program.md` for the marker `<!-- AUTORESEARCH:UNCONFIGURED -->`.** If present, the
+repo hasn't been pointed at a goal yet. Before anything else (even if the user asked something
+else, say you'll get them set up first), **run onboarding**:
 
-1. **Ask what they want to research**, using the `AskUserQuestion` tool. Cover, in order
-   (one question at a time, drilling in with follow-ups until it's unambiguous):
-   - **The research target** — what gets optimized. Offer sensible options, e.g.: *general
-     (lowest `val_bpb` by editing all of `train.py`)*, *a loss function that generalizes*,
-     *the optimizer*, *the architecture*, *data efficiency* — or a custom goal they type.
-   - **The success metric** — confirm it's `val_bpb` (lower = better), or what else, and
-     whether there's a secondary signal to watch (e.g. an overfitting gap).
-   - **Two time budgets (ask for both, separately):** (a) **per-experiment** minutes — how
-     long *one* `train.py` run trains (default 5); and (b) **session** hours — how long the
-     *whole* run lasts before the box auto-destroys (default 3, typically 2–3 h).
-   - **Hardware** — GPU type (default `RTX_4090`), parallel GPUs (default 4), price cap
-     (default $0.60/GPU/hr).
-   - **Any constraints** — things to avoid, must-keep, or specific ideas to try first.
-   Ask as many follow-ups as needed to get it *exactly* right — this is the one chance to
-   nail the direction.
+1. **Ask what they want to research**, with `AskUserQuestion` (one question at a time, drilling
+   in with follow-ups until it's unambiguous):
+   - **The research target.** What gets optimized? It can be **anything** — keep the LLM
+     default, or point it elsewhere (another ML task, an algorithm/heuristic, a kernel, a
+     solver, a prompt, a strategy…). Offer a few concrete options plus "something else (type it)".
+   - **The objective + direction.** What single number defines success, and is **lower or
+     higher** better? (LLM default: `val_bpb`, lower.) Note any secondary signal to watch.
+   - **How a run is scored.** What does one experiment *do*, and how is the number computed —
+     so we can make it a **frozen, un-gameable evaluator**? (For LLM: train, then `evaluate_bpb`.)
+   - **Two time budgets, separately:** per-experiment minutes (one run; default 5) and session
+     hours (whole run before auto-destroy; default 3, ~2–3 h typical).
+   - **Hardware:** GPU type (default `RTX_4090`), parallel GPUs (default 4), price cap
+     ($0.60/GPU/hr). If the task doesn't need a GPU, the box still has CPUs — note it.
+   - **Constraints / must-keeps / ideas to try first.**
 
-2. **Tailor the repo to their answers:**
-   - Rewrite `program.md` §1 (what we're optimizing), §2 (metric) and §4 (search axes) to
-     match the goal. Make the axes mutually exclusive for *this* target (e.g. a loss search
-     partitions by the math done to cross-entropy, not by model component).
-   - Set the §3 config defaults (minutes / hours / gpus / price / shards) to their choices.
-   - **At setup you may edit `prepare.py` freely** (this is the one allowed window for it —
-     e.g. shrink `TRAIN_TOKENS` for a data-constrained generalization study) as well as
-     `train.py`'s baseline. Say what you changed and why. (Once research launches, `prepare.py`
-     and the metric are frozen — only `train.py` changes during the loop, so no cheating.)
-   - **Remove the `<!-- AUTORESEARCH:UNCONFIGURED -->` marker line** from `program.md`.
+2. **Tailor the repo to their answers.**
+   - **If keeping the LLM default:** just rewrite `program.md` §1/§2/§4 for their angle, set §3
+     config, optionally tune `prepare.py` (e.g. `TRAIN_TOKENS`) and the `train.py` baseline.
+   - **If retargeting to another domain — the adaptation playbook:**
+     1. **Rewrite `train.py` as the experiment** for the new task. It must: run one trial and
+        **print exactly one `OBJECTIVE: <number>`** summary line (named whatever you choose),
+        plus any diagnostics as extra `name: number` lines. Keep it self-contained and
+        deterministic where possible.
+     2. **Rewrite `prepare.py` as the frozen harness/evaluator** — one-time setup (data/assets)
+        + the function that computes the objective. **Reuse its deadline helpers**
+        (`start_training_clock` / `except TrainingTimeUp` / `stop_training_clock`) so every run
+        is hard-bounded to the per-experiment budget and still emits a final score.
+     3. **Set the objective:** the session will use `vast.py start --metric OBJECTIVE --goal min|max`.
+        Record that name/direction in `program.md` §2/§3.
+     4. **Define disjoint axes in `program.md` §4** for the new domain — partition by *what part
+        of the experiment* a change touches, so two slots can never try the same thing.
+     5. **Adjust deps** in `pyproject.toml` if the task needs different libraries (installed at setup).
+   - In all cases set §3 config to their choices and **remove the `<!-- AUTORESEARCH:UNCONFIGURED -->`
+     marker** from `program.md`.
 
-3. **Confirm** the tailored mission back to the human in 2–3 lines, then offer to kick off a
-   session (`vast.py start …`). Don't start renting GPUs until they say go.
+3. **Smoke-test the contract before declaring done.** Once a box is up (or locally if it has the
+   right compute), run the experiment once and confirm it prints the `OBJECTIVE:` line and that
+   `vast.py exp` parses it. Fix until it runs clean — the whole point is that it works out of the box.
 
-## B) If already configured — proceed normally
+4. **Confirm** the tailored mission to the human in 2–3 lines, then offer to kick off a session
+   (`vast.py start --metric … --goal … …`). Don't rent GPUs until they say go.
 
-No marker → the mission is set. Read `program.md` (mission + config) and `ENGINE.md`
-(engine), then do what the user asked. To start a research session, follow `ENGINE.md`:
-bring the box up with `python vast.py start …`, then **spawn one subagent per GPU slot**
-(you orchestrate — you do **not** run experiments yourself) and run the round loop.
+## B) Already configured — proceed normally
+
+No marker → the mission is set. Read `program.md` + `ENGINE.md`, then do what the user asked.
+To start a session, follow `ENGINE.md`: `python vast.py start --metric … --goal … …`, then
+**spawn one subagent per GPU slot** (you orchestrate — you never run experiments yourself) and
+run the round loop.
 
 ---
 
-**Always:** never edit `ENGINE.md`. `prepare.py`'s `evaluate_bpb` and the `forward`→logits
-contract are ground truth. The full control plane is `python vast.py --help`.
+**Always:** never edit `ENGINE.md`. During research only the **experiment** file is edited; the
+**harness/evaluator is frozen** so the objective can't be gamed. Full control plane:
+`python vast.py --help`.

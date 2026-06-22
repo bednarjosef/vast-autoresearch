@@ -11,6 +11,14 @@ and the **knobs**. The fixed machinery (how the orchestrator + subagents actuall
 [`ENGINE.md`](ENGINE.md) — **do not edit that one.** When the human starts a session, read
 this file, then run the loop in `ENGINE.md`.
 
+> **autoresearch can optimize almost anything.** The sections below describe the **default**
+> instantiation — LLM pretraining, where the *experiment* is `train.py`, the *harness* is
+> `prepare.py`, and the *objective* is `val_bpb`. To research something else, onboarding
+> (`CLAUDE.md`) reshapes those: the experiment is whatever artifact you mutate (it just prints
+> `OBJECTIVE: <number>`), the harness is a frozen evaluator that computes that number, and the
+> objective + direction are set via `vast.py start --metric NAME --goal min|max`. Everything in
+> `ENGINE.md` (parallel slots, disjoint axes, compounding, safety) is the same for any domain.
+
 ---
 
 ## 1. What we're optimizing  ← edit this
@@ -18,6 +26,10 @@ this file, then run the loop in `ENGINE.md`.
 **Goal:** find the `train.py` that reaches the **lowest held-out `val_bpb`** within the
 fixed per-experiment training budget. Everything in `train.py` is fair game — architecture,
 optimizer, hyperparameters, training loop, batch size, model size.
+
+**Bias toward big wins.** Prefer **bold, novel, even architectural** changes with large upside
+over tiny hyperparameter tweaks. Micro-tuning and ±0.001 gains are secondary; the search should
+keep swinging for changes that could move the metric *a lot*. (See "SWING FOR BIG WINS" in `ENGINE.md`.)
 
 > Onboarding rewrites this section for your actual goal (e.g. "discover a loss that
 > generalizes", "find the best optimizer", "maximize data efficiency"). Keep it to a
@@ -41,14 +53,16 @@ There are **two independent time knobs** — pick both:
 
 | Knob | Default | What it controls |
 |------|---------|------------------|
-| **Per-experiment budget** | `--minutes 5` | how long **one** `train.py` run trains. Same for every run in the session (so they stay comparable). Shorter = more experiments/hr; longer = more signal per run. |
+| **Objective** | `--metric val_bpb` | the metric name the experiment prints (`OBJECTIVE: <number>`). |
+| **Direction** | `--goal min` | optimize it to `min` (lower better) or `max` (higher better). |
+| **Per-experiment budget** | `--minutes 5` | how long **one** experiment runs. Same for every run in the session (so they stay comparable). Shorter = more experiments/hr; longer = more signal per run. |
 | **Session length** | `--hours 3` | how long the whole research run lasts — the box's hard auto-destroy deadline (typically 2–3 h). |
 | **GPUs / parallel slots** | `--gpus 4` | one experiment runs per GPU; this is the max parallelism. |
 | **Price cap** | `--max-price 0.60` | $/GPU/hr ceiling. |
 | **GPU type** | `--gpu RTX_4090` | which GPU to rent. |
-| **Data shards** | `--num-shards 8` | how much training data to download at setup (more = slower setup). |
+| **Data shards** | `--num-shards 8` | how much training data to download at setup (more = slower setup; LLM-default only). |
 
-One-shot bring-up: `python vast.py start --gpus 4 --hours 3 --minutes 5 --max-price 0.60`.
+One-shot bring-up: `python vast.py start --metric val_bpb --goal min --gpus 4 --hours 3 --minutes 5 --max-price 0.60`.
 
 ## 4. The search axes  ← edit for your research focus
 
@@ -85,6 +99,11 @@ The boundary is **temporal**, and it's what keeps the score honest:
   can't be gamed. This is enforced structurally: `vast.py exp` uploads **only** `train.py`,
   so the box keeps the `prepare.py`/metric frozen at setup no matter what — a subagent
   editing `prepare.py` locally simply has no effect on its score.
+- **Keep the time-budget + eval scaffolding in `train.py`** when editing it: the
+  `start_training_clock()` call, the `try … except TrainingTimeUp` around the training loop,
+  and the final `evaluate_bpb` + `val_bpb:` print. They make every run hard-bounded to the
+  per-experiment budget and guarantee a graceful final eval — removing them just makes your
+  own run overrun or crash without a score.
 
 ---
 

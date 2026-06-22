@@ -90,11 +90,12 @@ Do this once, when the human starts a session:
 
 **You choose, per round, whether every subagent runs 1 or 2 experiments** — the SAME count
 for all slots that round. Each subagent runs exactly that many, **then STOPS and returns**.
-You spawn all slots in **one foreground, concurrent batch** and wait for it to return (add a
-"research scout" subagent to the same batch to mine the literature with the **`research`
-skill** while the GPUs are busy — see step 4). When the batch returns you **compound** the
-confirmed wins into the champion and dispatch the next round. Repeat — forever, the champion
-strictly improving by building UPON itself.
+You spawn all slots in **one foreground, concurrent batch — always plus a research-scout
+subagent** that mines the literature with the **`research` skill** while the GPUs train (the
+batch blocks you, so the scout is *how* research happens during the wait — see step 4) — and
+wait for it to return. When it does you **compound** the confirmed wins into the champion and
+dispatch the next round. Repeat — forever, the champion strictly improving by building UPON
+itself.
 
 - **1 each** for tight steering (early calibration, risky ideas, or little time left).
 - **2 each** to go deeper on a promising axis (idea + a natural follow-up in one dispatch).
@@ -103,9 +104,12 @@ strictly improving by building UPON itself.
 > mine the literature with the **`research` skill** (scholarly + web): find genuinely **novel
 > ideas**, the **current SOTA** for whatever you're optimizing, and evidence on whether an idea
 > is known to work or to fail (so you don't burn a GPU rediscovering it). Ground each slot's
-> direction in what you find. The cheapest way to do this without idling is to spawn a
-> **research-scout subagent in the same foreground batch** as the experiments (step 4). Lean on
-> the skill hard — it is your primary source of ideas, not your prior knowledge.
+> direction in what you find. **Triage abstracts first** (the skill's `--abstracts --json`
+> mode) to scan many ideas cheaply, then fetch full text only for the most promising. **Because
+> the foreground batch blocks you, you can't run the skill yourself while waiting — so EVERY
+> round you MUST include a research-scout subagent in the batch** to do it concurrently
+> (step 4); you may also research between rounds, when you're unblocked. Lean on the skill hard
+> — it is your primary source of ideas, not your prior knowledge.
 
 Each round, in order:
 
@@ -140,15 +144,21 @@ Each round, in order:
    never re-explored). Read both before assigning; **never re-assign anything on either list**,
    and never assign a close variant of a Banked idea.
 
-4. **Spawn N subagents in ONE message — FOREGROUND, concurrent — and wait for the batch.**
-   Use the Agent tool: one subagent per slot, the prompt below filled in, all in a single
-   message so they run in parallel. They run in the **foreground**; the call returns when all
-   slots have finished. **Never background the subagents or poll for them.** To mine the
-   literature *while the GPUs are busy* without backgrounding anything, add **one extra
-   subagent to the same batch** — a "research scout" that runs the **`research` skill** (or
-   web search) on the open question and returns fresh ideas alongside the experiment results.
-   (Alternatively, do the research yourself between rounds — just never via a background/poll
-   loop.) Fold what the scout finds into the next round's directions.
+4. **Spawn N experiment subagents + 1 research-scout in ONE message — FOREGROUND, concurrent
+   — and wait for the batch.** Use the Agent tool: one subagent per GPU slot (the prompt below
+   filled in) **plus a mandatory research-scout subagent**, all in a single message so they run
+   in parallel. They run in the **foreground**; the call returns when everything finishes.
+   **Never background the subagents or poll for them.**
+   - **The research-scout is REQUIRED every round — it is how research happens during the GPU
+     window.** Because the foreground batch blocks you until it returns, you *cannot* run the
+     `research` skill yourself while waiting. So the scout does it concurrently: task it to run
+     the **`research` skill** on the round's open question (triage abstracts first, fetch the
+     best), and return novel ideas + SOTA + what's known to work/fail. Its findings come back
+     **with** the experiment results, ready to shape the next round.
+   - You may *also* think/research directly **between rounds** (after the batch returns, before
+     the next dispatch) — that's the only time you're unblocked. Just never via a
+     background/poll loop. Fold everything (scout + your own reading) into the next round's
+     per-slot directions.
 
 5. **When they return, VERIFY against ground truth, then COMPOUND the genuine wins.** The
    champion grows by **accumulating** confirmed improvements — you build UPON it, you don't

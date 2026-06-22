@@ -64,8 +64,18 @@ time knobs: **`--minutes`** = how long *one* experiment trains; **`--hours`** = 
 
 ## Research-driven ideas — the `research` skill
 
-The swarm doesn't only brainstorm from memory. Every round the orchestrator leans on the
-**`research` skill** (scholarly + web search) to:
+The swarm doesn't only brainstorm from memory. It uses the
+[**`research` skill**](https://github.com/bednarjosef/claude-research-skill) — which searches
+[OpenAlex](https://openalex.org), fetches open-access PDFs, and converts them to Markdown so
+the agent *reads* papers (line-numbered) instead of just citing them. **Install it once**
+(keyless — no API key):
+
+```bash
+git clone https://github.com/bednarjosef/claude-research-skill
+cd claude-research-skill && ./install.sh   # symlinks into ~/.claude/skills/research/
+```
+
+Every round the orchestrator leans on it to:
 
 - surface **novel ideas** and **current SOTA** for whatever is being optimized,
 - check whether an idea is already known to work (or to fail), before spending a GPU on it,
@@ -73,9 +83,10 @@ The swarm doesn't only brainstorm from memory. Every round the orchestrator lean
 
 To keep the GPUs busy while it reads, a **"research scout" subagent** joins the same
 foreground batch as the experiment subagents — so literature mining happens *concurrently*
-with training, and fresh ideas arrive with the fresh numbers. `ENGINE.md` explicitly directs
-the agent to use the skill for ideation, SOTA-hunting, and verification — not to rely on what
-it already knows.
+with training, and fresh ideas arrive with the fresh numbers. It scans **abstracts first**
+(cheap) and only fetches full text for the most promising leads. `ENGINE.md` explicitly
+directs the agent to use the skill for ideation, SOTA-hunting, and verification — not to rely
+on what it already knows.
 
 ## Control plane (`vast.py`)
 

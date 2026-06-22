@@ -619,40 +619,43 @@ def _fval(x) -> float | None:
 def _svg_chart(rows: list[dict], w: int = 920, h: int = 340) -> str:
     """Inline SVG (no JS/CDN): val_bpb per experiment, colored by status, with a
     green 'best so far' line. Lower is better, so improvement trends downward."""
-    pts = [(i, _fval(r["val_bpb"]), r["status"]) for i, r in enumerate(rows)]
-    pts = [(i, v, st) for i, v, st in pts if v and v > 0 and st != "crash"]
+    # Keep only plotted points (valid val_bpb, not a crash). Index by POSITION among the
+    # plotted points (j), NOT the original row index — otherwise filtering a crash/discard
+    # pushes later points off the right edge and the chart looks blank.
+    pts = [(v, r["status"]) for r in rows
+           if (v := _fval(r["val_bpb"])) and v > 0 and r["status"] != "crash"]
     if not pts:
         return "<p class=muted>No completed experiments yet — the chart fills in as results log.</p>"
     pl, pr, pt, pb = 64, 18, 18, 34
     pw, ph = w - pl - pr, h - pt - pb
-    vals = [v for _, v, _ in pts]
+    vals = [v for v, _ in pts]
     ymin, ymax = min(vals), max(vals)
     if ymax - ymin < 1e-9:
         ymin, ymax = ymin - 0.01, ymax + 0.01
     n = len(pts)
-    fx = lambda i: pl + (i / (n - 1) * pw if n > 1 else pw / 2)
-    fy = lambda v: pt + (ymax - v) / (ymax - ymin) * ph  # low val -> low on screen
+    fx = lambda j: pl + (j / (n - 1) * pw if n > 1 else pw / 2)  # j = position among plotted
+    fy = lambda v: pt + (ymax - v) / (ymax - ymin) * ph          # low val -> low on screen
 
     parts = [f'<svg viewBox="0 0 {w} {h}" width="100%" preserveAspectRatio="xMidYMid meet">']
-    parts.append(f'<rect x=0 y=0 width={w} height={h} fill="#0f1419" rx=8/>')
+    parts.append(f'<rect x="0" y="0" width="{w}" height="{h}" fill="#0f1419" rx="8"/>')
     # y gridlines + labels
     for k in range(5):
         v = ymax - k / 4 * (ymax - ymin)
         y = pt + k / 4 * ph
-        parts.append(f'<line x1={pl} y1={y:.1f} x2={w-pr} y2={y:.1f} stroke="#1f2937"/>')
-        parts.append(f'<text x={pl-8} y={y+4:.1f} fill="#6b7280" font-size=11 text-anchor=end>{v:.4f}</text>')
+        parts.append(f'<line x1="{pl}" y1="{y:.1f}" x2="{w-pr}" y2="{y:.1f}" stroke="#1f2937"/>')
+        parts.append(f'<text x="{pl-8}" y="{y+4:.1f}" fill="#6b7280" font-size="11" text-anchor="end">{v:.4f}</text>')
     # best-so-far line (running min)
     best, bpath = float("inf"), []
-    for i, v, _ in pts:
+    for j, (v, _) in enumerate(pts):
         best = min(best, v)
-        bpath.append(f"{fx(i):.1f},{fy(best):.1f}")
-    parts.append(f'<polyline points="{" ".join(bpath)}" fill=none stroke="#34d399" stroke-width=2/>')
+        bpath.append(f"{fx(j):.1f},{fy(best):.1f}")
+    parts.append(f'<polyline points="{" ".join(bpath)}" fill="none" stroke="#34d399" stroke-width="2"/>')
     # points
-    for i, v, st in pts:
+    for j, (v, st) in enumerate(pts):
         c = {"keep": "#34d399", "discard": "#6b7280"}.get(st, "#f59e0b")
-        parts.append(f'<circle cx={fx(i):.1f} cy={fy(v):.1f} r=3.4 fill="{c}"/>')
-    parts.append(f'<text x={pl} y={h-10} fill="#6b7280" font-size=11>experiments → ({n} plotted)</text>')
-    parts.append(f'<text x={w-pr} y={h-10} fill="#34d399" font-size=11 text-anchor=end>best {min(vals):.6f}</text>')
+        parts.append(f'<circle cx="{fx(j):.1f}" cy="{fy(v):.1f}" r="3.4" fill="{c}"/>')
+    parts.append(f'<text x="{pl}" y="{h-10}" fill="#6b7280" font-size="11">experiments → ({n} plotted)</text>')
+    parts.append(f'<text x="{w-pr}" y="{h-10}" fill="#34d399" font-size="11" text-anchor="end">best {min(vals):.6f}</text>')
     parts.append("</svg>")
     return "".join(parts)
 

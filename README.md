@@ -69,9 +69,21 @@ python vast.py watchdog &                               # auto-destroy at the de
 python vast.py setup                                    # template torch + light deps + data + topology (no torch download)
 python vast.py bench                                    # confirm GPUs are equivalent + measure contention
 python vast.py exp --slot 0 --train train.py            # run one experiment on GPU 0
+python vast.py reap                                     # kill any stray/ghost runs; show what's on the GPUs
 python vast.py dashboard                                # live browser view of progress (see below)
 python vast.py down                                     # destroy the box + clear state
 ```
+
+**Orchestration (`program.md`).** The main agent is an **orchestrator**: each round it
+gives every GPU slot a **disjoint axis** (optimizer / attention / MLP+norm / capacity /
+embeddings+init) with concrete ideas and an explicit off-limits list, so subagents never
+overlap. It picks **1 or 2 experiments per round** (same for all slots); each subagent runs
+exactly that many, **then returns**. While they run, the orchestrator analyzes results and
+mines the literature with the `research` skill, then **stacks every confirmed win into the
+champion** and dispatches the next, more-informed round — so `val_bpb` keeps dropping over
+the whole session. Runs are bounded by `train.py`'s own `TIME_BUDGET` (no force-kill), the
+baseline is sized to fit a 24 GB GPU, OOMs are treated as failures, and `reap` clears any
+ghost runs between rounds.
 
 **Watch it live.** `python vast.py dashboard` starts a tiny local web server (stdlib
 only, no deps) and opens a browser page that auto-refreshes every 5s: a **val_bpb chart**

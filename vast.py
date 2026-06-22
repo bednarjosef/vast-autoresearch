@@ -454,7 +454,12 @@ def cmd_exp(a) -> None:
     ssh_run(s, f"mkdir -p {workdir} {cache}")
     scp_to(s, str(train), f"{workdir}/train.py")
     log = f"{workdir}/run.log"
-    remote = (_train_invocation(s, slot, f"{workdir}/train.py", cache) + f" > {log} 2>&1; "
+    inv = _train_invocation(s, slot, f"{workdir}/train.py", cache)
+    # Reap any GHOST run still holding this slot's GPU before starting (clears leftovers
+    # from a died subagent). The run itself is NOT force-killed — train.py self-stops at
+    # TIME_BUDGET, so a healthy run ends on its own.
+    remote = (f'pkill -9 -f "{workdir}/train.py" 2>/dev/null; sleep 1; '
+              f"{inv} > {log} 2>&1; "
               f"grep -E '^({'|'.join(METRIC_KEYS)}):' {log} || "
               f"(echo '--- CRASH (tail) ---'; tail -n 40 {log})")
     print(f"[slot{slot}/gpu{slot}] running train.py (cores {slot_cores(s, slot)[1]})…",
@@ -463,14 +468,17 @@ def cmd_exp(a) -> None:
     r = ssh_run(s, remote)
     dt = time.time() - t0
     m = parse_metrics(r.stdout)
+    oom = "out of memory" in r.stdout.lower() or "outofmemory" in r.stdout.lower()
     if "val_bpb" in m:
         result = {"slot": slot, "ok": True, "wall_seconds": round(dt, 1), **m}
         print(f"[slot{slot}] val_bpb={m['val_bpb']:.6f}  "
               f"vram={m.get('peak_vram_mb', 0)/1024:.1f}GB  "
               f"steps={int(m.get('num_steps', 0))}  wall={dt:.0f}s")
     else:
-        result = {"slot": slot, "ok": False, "wall_seconds": round(dt, 1)}
-        print(f"[slot{slot}] CRASH / no val_bpb. tail:\n{r.stdout[-1500:]}")
+        reason = "OOM" if oom else "CRASH"
+        result = {"slot": slot, "ok": False, "reason": reason, "wall_seconds": round(dt, 1)}
+        hint = "  (lower DEVICE_BATCH_SIZE / model size; treat as discard)" if oom else ""
+        print(f"[slot{slot}] {reason} / no val_bpb{hint}. tail:\n{r.stdout[-1500:]}")
     print("RESULT_JSON:" + json.dumps(result))
     sys.exit(0 if result["ok"] else 1)
 
@@ -736,6 +744,22 @@ def cmd_dashboard(a) -> None:
 
 # --- misc commands -------------------------------------------------------------
 
+def cmd_reap(a) -> None:
+    """Kill stray train.py runs on the box (ghost runs from died/abandoned subagents)
+    and show what's still on the GPUs. Run between rounds, or with --slot to clear one."""
+    s = require_state()
+    if a.slot is not None:
+        ssh_run(s, f'pkill -9 -f "{REMOTE_DIR}/slots/slot{a.slot}/train.py" 2>/dev/null')
+        print(f"reaped any run on slot{a.slot}")
+    else:
+        ssh_run(s, f'pkill -9 -f "{REMOTE_DIR}/slots/.*train\\.py" 2>/dev/null; '
+                   f'pkill -9 -f "{REMOTE_DIR}/train.py" 2>/dev/null')
+        print("reaped all stray train.py runs")
+    out = ssh_run(s, "nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory "
+                     "--format=csv,noheader 2>/dev/null").stdout.strip()
+    print("GPU compute processes now:\n  " + (out.replace("\n", "\n  ") if out else "(none)"))
+
+
 def cmd_run(a) -> None:
     s = require_state()
     sys.exit(subprocess.run(ssh_base(s) + [f"cd {REMOTE_DIR} && {a.command}"]).returncode)
@@ -848,6 +872,8 @@ def main() -> None:
     ep = add("exp", cmd_exp)
     ep.add_argument("--slot", type=int, required=True)
     ep.add_argument("--train", required=True, help="path to the train.py to run")
+    rpz = add("reap", cmd_reap)
+    rpz.add_argument("--slot", type=int, default=None, help="only this slot (default: all)")
     rp = add("run", cmd_run)
     rp.add_argument("command")
     pp = add("pull", cmd_pull)

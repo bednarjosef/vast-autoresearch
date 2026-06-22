@@ -263,14 +263,37 @@ def cmd_up(a) -> None:
         "gpu": best["gpu_name"], "num_gpus": best.get("num_gpus", a.gpus),
         "cpu_cores": int(best.get("cpu_cores_effective") or best.get("cpu_cores", 0)),
         "created_at": now, "deadline": now + a.hours * 3600,
+        "time_budget_s": int(getattr(a, "minutes", 5) * 60),  # per-experiment training budget
         "host": None, "port": None, "ready": False, "remote_py": DEFAULT_REMOTE_PY,
     })
     print(f"created instance {iid} at ${best['dph_total']:.3f}/hr "
-          f"({best.get('num_gpus', a.gpus)} GPUs); auto-destroy deadline in {a.hours}h.")
+          f"({best.get('num_gpus', a.gpus)} GPUs); auto-destroy deadline in {a.hours}h; "
+          f"per-experiment budget {getattr(a, 'minutes', 5):.0f} min.")
     print("IMPORTANT: start the watchdog now so the box can't be left billing:\n"
           "  python vast.py watchdog &")
     print("waiting for it to boot…")
     _wait_running()
+
+
+def _spawn_watchdog() -> None:
+    """Launch the deadline watchdog as a detached background process so the box can't be
+    left billing — survives this command returning."""
+    subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "watchdog"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL, start_new_session=True)
+    print("watchdog: launched in background (auto-destroys the box at the deadline).")
+
+
+def cmd_start(a) -> None:
+    """One-shot session bring-up: rent → watchdog → setup → bench. Collapses four manual
+    steps into one robust command so the orchestrator starts fast with sane defaults."""
+    cmd_up(a)            # rents + waits until running (sys.exit on failure)
+    _spawn_watchdog()
+    cmd_setup(a)         # template torch + light deps + data + topology
+    cmd_bench(a)         # ~1-min objectivity check + warms per-slot compile caches
+    print("\n=== READY ===")
+    print("box up + prepared + benched. Next (orchestrator): create worktrees, run the "
+          "baseline on slot 0, then start the round loop. See ENGINE.md.")
 
 
 def _wait_running() -> None:
@@ -298,7 +321,8 @@ def cmd_status(a) -> None:
     info = vast(["show", "instance", str(s["instance_id"])], raw=True, check=False)
     up_h = (time.time() - s["created_at"]) / 3600
     print(f"instance {s['instance_id']}  {s['num_gpus']}x {s['gpu']}  "
-          f"${s['dph']:.3f}/hr  cpu_cores={s.get('cpu_cores', '?')}")
+          f"${s['dph']:.3f}/hr  cpu_cores={s.get('cpu_cores', '?')}  "
+          f"exp_budget={s.get('time_budget_s', 300)//60}min")
     print(f"  status: {info.get('actual_status') if isinstance(info, dict) else '?'}")
     print(f"  uptime: {up_h:.2f}h   est. cost so far: ${up_h * s['dph']:.2f}")
     print(f"  deadline in: {(s['deadline'] - time.time()) / 3600:.2f}h")
@@ -432,8 +456,9 @@ def _train_invocation(s: dict, slot: int, script: str, cache_dir: str | None = N
     gpu = slot  # slot N -> GPU N
     py = s.get("remote_py", DEFAULT_REMOTE_PY)  # template torch by default; uv .venv fallback
     cache = f"TORCHINDUCTOR_CACHE_DIR={cache_dir} " if cache_dir else ""
+    budget = s.get("time_budget_s", 300)  # variable per session; prepare.py reads AR_TIME_BUDGET
     return (f"taskset -c {cores} env CUDA_VISIBLE_DEVICES={gpu} OMP_NUM_THREADS={cps} "
-            f"OPENBLAS_NUM_THREADS={cps} PYTHONPATH={REMOTE_DIR} {cache}"
+            f"OPENBLAS_NUM_THREADS={cps} PYTHONPATH={REMOTE_DIR} AR_TIME_BUDGET={budget} {cache}"
             f"{py} {script}")
 
 
@@ -443,6 +468,8 @@ def cmd_exp(a) -> None:
     s = require_state()
     if not s.get("ready"):
         print("WARN: box not marked ready; run `vast.py setup` first.", file=sys.stderr)
+    if a.minutes:  # per-run budget override (default: the session's time_budget_s)
+        s = {**s, "time_budget_s": int(a.minutes * 60)}
     slot = a.slot
     if slot >= s["num_gpus"]:
         sys.exit(f"slot {slot} out of range (box has {s['num_gpus']} GPUs)")
@@ -524,6 +551,14 @@ def cmd_bench(a) -> None:
     print("— solo / warm-up (gpu0) —")
     solo = _bench_one(s, 0, warm)
     print(f"  gpu0: {solo:,.0f} tok/sec" if solo else "  gpu0: no reading")
+
+    # Seed every slot's per-slot compile cache from the now-warm bench cache, so the FIRST
+    # experiment on each slot (the baseline / first round) skips torch.compile (~30-60s).
+    ssh_run(s, "; ".join(
+        f"mkdir -p {REMOTE_DIR}/.inductor/slot{i}; "
+        f"cp -rn {BENCH_CACHE}/. {REMOTE_DIR}/.inductor/slot{i}/ 2>/dev/null"
+        for i in range(G)))
+    print(f"  seeded {G} per-slot compile caches (warm first experiments).")
 
     report = {"seconds": a.seconds, "solo_gpu0": solo}
     if G == 1:
@@ -851,27 +886,37 @@ def main() -> None:
         p.set_defaults(fn=fn)
         return p
 
-    for name in ("search", "up"):
-        p = add(name, cmd_search if name == "search" else cmd_up)
+    def add_rent_args(p, full):
         p.add_argument("--gpu", default=DEFAULT_GPU)
         p.add_argument("--gpus", type=int, default=4, help="GPUs on the box = max parallel slots")
         p.add_argument("--max-price", type=float, default=0.60, help="cap in $/GPU/hr")
-        if name == "up":
+        if full:
             p.add_argument("--hours", type=float, default=3.0, help="session length (auto-destroy)")
+            p.add_argument("--minutes", type=float, default=5.0,
+                           help="per-experiment training budget, minutes (variable per session)")
             p.add_argument("--disk", type=int, default=80)
             p.add_argument("--image", default=None, help="raw docker image (default: Vast PyTorch template)")
             p.add_argument("--offer-id", type=int, default=None, help="rent this exact offer id")
 
+    add_rent_args(add("search", cmd_search), full=False)
+    add_rent_args(add("up", cmd_up), full=True)
+    stp = add("start", cmd_start)  # one-shot: up + watchdog + setup + bench
+    add_rent_args(stp, full=True)
+    stp.add_argument("--num-shards", type=int, default=8)
+    stp.add_argument("--seconds", type=int, default=15, help="bench window per phase")
+
     add("status", cmd_status)
     add("sync", cmd_sync)
     sp = add("setup", cmd_setup)
-    sp.add_argument("--num-shards", type=int, default=16, help="train shards to download")
+    sp.add_argument("--num-shards", type=int, default=8, help="train shards to download")
     bp = add("bench", cmd_bench)
     bp.add_argument("--seconds", type=int, default=15,
                     help="warm measurement window per phase (total bench ~1 min)")
     ep = add("exp", cmd_exp)
     ep.add_argument("--slot", type=int, required=True)
     ep.add_argument("--train", required=True, help="path to the train.py to run")
+    ep.add_argument("--minutes", type=float, default=None,
+                    help="override this run's training budget (default: the session's)")
     rpz = add("reap", cmd_reap)
     rpz.add_argument("--slot", type=int, default=None, help="only this slot (default: all)")
     rp = add("run", cmd_run)

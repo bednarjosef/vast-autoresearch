@@ -41,49 +41,56 @@ If the above commands all work ok, your setup is working and you can go into aut
 
 ## Running the agent
 
-Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
+Spin up Claude Code in this repo (disable permissions for autonomy). **On a fresh clone the
+agent onboards you automatically** — `CLAUDE.md` detects the unconfigured marker and asks
+what you want to research (target, metric, per-experiment budget, GPUs, session length),
+then tailors `program.md` to your goal. After that, just say "kick off a session".
 
-```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
-```
-
-The `program.md` file is essentially a super lightweight "skill".
+The docs split into two roles:
+- **`program.md`** — the **mission & config** you edit (what to optimize, the metric, the
+  knobs, the search axes).
+- **`ENGINE.md`** — the **fixed engine** (how the orchestrator + subagents run a session).
+  Not edited by the human or the agent.
 
 ## Running on Vast.ai (this fork)
 
 This fork adds **`vast.py`** so you can run the whole thing from a laptop with **no
 local GPU**. The agents and the research loop stay on your machine; only the GPU work
-(`train.py`, the 5-minute budget) runs on **one rented Vast.ai box per session** with
+(`train.py`, the per-experiment training budget) runs on **one rented Vast.ai box per session** with
 several GPUs, so a pool of subagents can run experiments **in parallel** — one per GPU,
 each pinned to its own GPU + CPU cores so they never interfere — while sharing a single
 ledger (`results.tsv`) and knowledge log (`findings.md`).
 
 **One-time:** `vastai set api-key <KEY>` (an ssh key is auto-created/registered).
 
-**Each session,** just tell your agent to read `program.md` and start — it will ask how
-long you want to run, then drive `vast.py`:
+**Each session,** the agent brings the box up with one command, then runs the loop:
 
 ```bash
-python vast.py up --gpus 4 --hours 3 --max-price 0.60   # cheapest qualifying box ($/GPU/hr cap)
-python vast.py watchdog &                               # auto-destroy at the deadline (safety)
-python vast.py setup                                    # template torch + light deps + data + topology (no torch download)
-python vast.py bench                                    # confirm GPUs are equivalent + measure contention
-python vast.py exp --slot 0 --train train.py            # run one experiment on GPU 0
-python vast.py reap                                     # kill any stray/ghost runs; show what's on the GPUs
-python vast.py dashboard                                # live browser view of progress (see below)
-python vast.py down                                     # destroy the box + clear state
+# one-shot: rent cheapest qualifying box + background watchdog + setup + ~1-min bench
+python vast.py start --gpus 4 --hours 3 --minutes 5 --max-price 0.60
+python vast.py dashboard          # live browser view of progress (see below)
+python vast.py reap               # between rounds: kill stray/ghost runs; show GPU procs
+python vast.py down               # destroy the box + clear state
 ```
 
-**Orchestration (`program.md`).** The main agent is an **orchestrator**: each round it
-gives every GPU slot a **disjoint axis** (optimizer / attention / MLP+norm / capacity /
+`--minutes` sets the per-experiment training budget (variable per session; same for every
+run so they stay comparable). `start` rolls up the old `up`/`watchdog`/`setup`/`bench` steps
+(they still exist individually) and warms each slot's compile cache so the first experiments
+start fast.
+
+**Orchestration (`ENGINE.md`).** The main agent is an **orchestrator**: each round it gives
+every GPU slot a **disjoint axis** (e.g. optimizer / attention / MLP+norm / capacity /
 embeddings+init) with concrete ideas and an explicit off-limits list, so subagents never
-overlap. It picks **1 or 2 experiments per round** (same for all slots); each subagent runs
-exactly that many, **then returns**. While they run, the orchestrator analyzes results and
-mines the literature with the `research` skill, then **stacks every confirmed win into the
-champion** and dispatches the next, more-informed round — so `val_bpb` keeps dropping over
-the whole session. Runs are bounded by `train.py`'s own `TIME_BUDGET` (no force-kill), the
-baseline is sized to fit a 24 GB GPU, OOMs are treated as failures, and `reap` clears any
-ghost runs between rounds.
+overlap. It picks **1 or 2 experiments per round** (same for all slots) and **spawns one
+subagent per GPU — all foreground, in a single concurrent batch** (never backgrounded,
+never polled; it never runs experiments itself). Each subagent runs exactly that many,
+**then returns**. The orchestrator then **compounds**: it verifies wins, and when two land
+it **tests their combination and adopts the best as the new base**, so the champion is
+always "everything that's worked so far" and `val_bpb` keeps dropping over the whole session
+(it builds *upon* the champion, not from scratch). **Anti-cheat:** during research only
+`train.py` changes — `exp` uploads just that file, so the frozen `prepare.py`/metric score
+every run. Runs are bounded by `train.py`'s own budget (no force-kill), the baseline fits a
+24 GB GPU, OOMs are failures, and `reap` clears ghosts between rounds.
 
 **Watch it live.** `python vast.py dashboard` starts a tiny local web server (stdlib
 only, no deps) and opens a browser page that auto-refreshes every 5s: a **val_bpb chart**
@@ -103,8 +110,10 @@ session is roughly $4.
 ```
 prepare.py      — constants, data prep + runtime utilities (do not modify)
 train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions (Vast + parallel orchestration)
-vast.py         — Vast.ai control plane (rent/setup/bench/run/teardown)
+CLAUDE.md       — session-start router: onboards a fresh clone, else proceeds
+program.md      — MISSION & CONFIG: what to optimize + knobs (edit this)
+ENGINE.md       — fixed orchestration engine: how the swarm runs (do not edit)
+vast.py         — Vast.ai control plane (start/exp/bench/reap/dashboard/teardown)
 pyproject.toml  — dependencies
 ```
 

@@ -28,7 +28,10 @@ import torch
 # ---------------------------------------------------------------------------
 
 MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
+# Training time budget in seconds. Default 5 min; the human sets it per session via
+# `vast.py` (AR_TIME_BUDGET), so it's variable across sessions but fixed within one (it
+# must be constant for runs to stay comparable). Agents do not edit prepare.py.
+TIME_BUDGET = int(os.environ.get("AR_TIME_BUDGET", "300"))
 EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 
 # ---------------------------------------------------------------------------

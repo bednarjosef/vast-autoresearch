@@ -69,8 +69,17 @@ python vast.py watchdog &                               # auto-destroy at the de
 python vast.py setup                                    # venv + data + tokenizer + topology
 python vast.py bench                                    # confirm GPUs are equivalent + measure contention
 python vast.py exp --slot 0 --train train.py            # run one experiment on GPU 0
+python vast.py dashboard                                # live browser view of progress (see below)
 python vast.py down                                     # destroy the box + clear state
 ```
+
+**Watch it live.** `python vast.py dashboard` starts a tiny local web server (stdlib
+only, no deps) and opens a browser page that auto-refreshes every 5s: a **val_bpb chart**
+over experiments (with a "best so far" line), a leaderboard, recent runs, and a live box
+panel (GPUs, $/hr, uptime, **spend so far**, and **deadline countdown**). It just reads
+the local `results.tsv` and `.vast_state.json`, so it updates as the swarm logs results
+— leave it open overnight. For a quick one-shot status in the terminal, use
+`python vast.py status`.
 
 Safety is built in: exactly one tracked box at a time with a hard auto-destroy
 deadline, a background `watchdog`, and `ps`/`nuke` to catch orphans. Run

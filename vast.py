@@ -49,6 +49,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import re
 import shutil
@@ -56,8 +57,11 @@ import statistics
 import subprocess
 import sys
 import time
+import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from string import Template
 
 REPO = Path(__file__).resolve().parent
 STATE = REPO / ".vast_state.json"
@@ -524,6 +528,189 @@ def cmd_bench(a) -> None:
     print("\nsaved bench.json (read this before trusting cross-run comparisons).")
 
 
+# --- dashboard (local live visualization) --------------------------------------
+
+def _read_results() -> list[dict]:
+    """Parse results.tsv (the shared ledger every slot appends to via `vast.py log`)."""
+    if not RESULTS.exists():
+        return []
+    rows = []
+    for line in RESULTS.read_text().splitlines():
+        if not line.strip() or line.startswith("commit\t"):
+            continue
+        p = (line.split("\t") + [""] * 6)[:6]
+        rows.append(dict(zip(("commit", "val_bpb", "memory_gb", "status", "branch", "description"), p)))
+    return rows
+
+
+def _fval(x) -> float | None:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _svg_chart(rows: list[dict], w: int = 920, h: int = 340) -> str:
+    """Inline SVG (no JS/CDN): val_bpb per experiment, colored by status, with a
+    green 'best so far' line. Lower is better, so improvement trends downward."""
+    pts = [(i, _fval(r["val_bpb"]), r["status"]) for i, r in enumerate(rows)]
+    pts = [(i, v, st) for i, v, st in pts if v and v > 0 and st != "crash"]
+    if not pts:
+        return "<p class=muted>No completed experiments yet — the chart fills in as results log.</p>"
+    pl, pr, pt, pb = 64, 18, 18, 34
+    pw, ph = w - pl - pr, h - pt - pb
+    vals = [v for _, v, _ in pts]
+    ymin, ymax = min(vals), max(vals)
+    if ymax - ymin < 1e-9:
+        ymin, ymax = ymin - 0.01, ymax + 0.01
+    n = len(pts)
+    fx = lambda i: pl + (i / (n - 1) * pw if n > 1 else pw / 2)
+    fy = lambda v: pt + (ymax - v) / (ymax - ymin) * ph  # low val -> low on screen
+
+    parts = [f'<svg viewBox="0 0 {w} {h}" width="100%" preserveAspectRatio="xMidYMid meet">']
+    parts.append(f'<rect x=0 y=0 width={w} height={h} fill="#0f1419" rx=8/>')
+    # y gridlines + labels
+    for k in range(5):
+        v = ymax - k / 4 * (ymax - ymin)
+        y = pt + k / 4 * ph
+        parts.append(f'<line x1={pl} y1={y:.1f} x2={w-pr} y2={y:.1f} stroke="#1f2937"/>')
+        parts.append(f'<text x={pl-8} y={y+4:.1f} fill="#6b7280" font-size=11 text-anchor=end>{v:.4f}</text>')
+    # best-so-far line (running min)
+    best, bpath = float("inf"), []
+    for i, v, _ in pts:
+        best = min(best, v)
+        bpath.append(f"{fx(i):.1f},{fy(best):.1f}")
+    parts.append(f'<polyline points="{" ".join(bpath)}" fill=none stroke="#34d399" stroke-width=2/>')
+    # points
+    for i, v, st in pts:
+        c = {"keep": "#34d399", "discard": "#6b7280"}.get(st, "#f59e0b")
+        parts.append(f'<circle cx={fx(i):.1f} cy={fy(v):.1f} r=3.4 fill="{c}"/>')
+    parts.append(f'<text x={pl} y={h-10} fill="#6b7280" font-size=11>experiments → ({n} plotted)</text>')
+    parts.append(f'<text x={w-pr} y={h-10} fill="#34d399" font-size=11 text-anchor=end>best {min(vals):.6f}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _box_panel(s: dict | None) -> str:
+    if not s:
+        return '<div class="card warn">No active box (no .vast_state.json). Start one: <code>python vast.py up</code></div>'
+    up_h = (time.time() - s["created_at"]) / 3600
+    total_h = (s["deadline"] - s["created_at"]) / 3600
+    left_h = (s["deadline"] - time.time()) / 3600
+    frac = max(0.0, min(1.0, up_h / total_h)) if total_h else 0
+    cost = up_h * s["dph"]
+    chips = [
+        f'<b>{s["num_gpus"]}× {html.escape(str(s["gpu"]))}</b>',
+        f'${s["dph"]:.3f}/hr',
+        f'up {up_h:.2f}h',
+        f'spent ${cost:.2f}',
+        (f'deadline in {left_h:.2f}h' if left_h > 0 else 'DEADLINE PASSED'),
+    ]
+    bar = (f'<div class=bar><div class=fill style="width:{frac*100:.1f}%"></div></div>'
+           f'<div class=muted style="margin-top:4px">session {up_h:.2f}h / {total_h:.1f}h</div>')
+    return f'<div class=card><div class=chips>{" ".join(f"<span>{c}</span>" for c in chips)}</div>{bar}</div>'
+
+
+def _stats_panel(rows: list[dict]) -> str:
+    keeps = [r for r in rows if r["status"] == "keep"]
+    disc = sum(1 for r in rows if r["status"] == "discard")
+    crash = sum(1 for r in rows if r["status"] == "crash")
+    valid = [v for v in (_fval(r["val_bpb"]) for r in keeps) if v and v > 0]
+    best = min(valid) if valid else None
+    cells = [("experiments", len(rows)), ("keeps", len(keeps)), ("discards", disc),
+             ("crashes", crash), ("best val_bpb", f"{best:.6f}" if best else "—")]
+    return '<div class=stats>' + "".join(
+        f'<div><div class=k>{html.escape(str(v))}</div><div class=muted>{lbl}</div></div>'
+        for lbl, v in cells) + '</div>'
+
+
+def _table(rows: list[dict], cols: list[tuple[str, str]]) -> str:
+    head = "".join(f"<th>{c}</th>" for c, _ in cols)
+    body = ""
+    for r in rows:
+        body += "<tr>" + "".join(f"<td>{html.escape(str(r.get(k, '')))}</td>" for _, k in cols) + "</tr>"
+    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+
+PAGE = Template("""<!doctype html><html><head><meta charset=utf-8>
+<meta http-equiv=refresh content=5><title>autoresearch</title><style>
+*{box-sizing:border-box}body{margin:0;background:#0b0e13;color:#e5e7eb;
+font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;padding:22px}
+h1{margin:0 0 4px;font-size:20px}h2{font-size:13px;text-transform:uppercase;
+letter-spacing:.05em;color:#9ca3af;margin:0 0 10px}.sub{color:#34d399;font-size:12px}
+.card{background:#111722;border:1px solid #1f2937;border-radius:10px;padding:16px;margin:14px 0}
+.warn{border-color:#f59e0b;color:#fbbf24}.muted{color:#6b7280;font-size:12px}
+.chips span{display:inline-block;background:#0f1419;border:1px solid #1f2937;border-radius:999px;
+padding:4px 12px;margin:0 6px 6px 0}.chips b{color:#fff}
+.bar{height:8px;background:#0f1419;border-radius:999px;overflow:hidden;margin-top:12px}
+.fill{height:100%;background:linear-gradient(90deg,#34d399,#10b981)}
+.stats{display:flex;gap:26px;flex-wrap:wrap}.stats .k{font-size:22px;color:#fff;font-weight:600}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:820px){.grid{grid-template-columns:1fr}}
+table{width:100%;border-collapse:collapse;font-size:12.5px}th{text-align:left;color:#6b7280;
+font-weight:500;padding:5px 8px;border-bottom:1px solid #1f2937}td{padding:5px 8px;
+border-bottom:1px solid #141b26;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:340px}
+pre{white-space:pre-wrap;color:#cbd5e1;font-size:12px;margin:0;max-height:280px;overflow:auto}
+code{background:#0f1419;padding:1px 6px;border-radius:4px}a{color:#34d399}
+</style></head><body>
+<h1>autoresearch <span class=sub>● live · refreshes every 5s</span></h1>
+$box$stats
+<div class=card><h2>val_bpb over experiments (lower = better)</h2>$chart</div>
+<div class=grid>
+<div class=card><h2>Leaderboard (best keeps)</h2>$leaderboard</div>
+<div class=card><h2>Recent</h2>$recent</div></div>
+<div class=card><h2>findings.md</h2><pre>$findings</pre></div>
+</body></html>""")
+
+
+def _render_page() -> str:
+    rows = _read_results()
+    state = load_state()
+    keeps = sorted((r for r in rows if r["status"] == "keep" and (_fval(r["val_bpb"]) or 0) > 0),
+                   key=lambda r: _fval(r["val_bpb"]))
+    cols = [("val_bpb", "val_bpb"), ("slot", "branch"), ("mem", "memory_gb"),
+            ("commit", "commit"), ("description", "description")]
+    findings = (REPO / "findings.md").read_text()[-4000:] if (REPO / "findings.md").exists() else "(no findings.md yet)"
+    return PAGE.safe_substitute(
+        box=_box_panel(state),
+        stats=f'<div class=card>{_stats_panel(rows)}</div>',
+        chart=_svg_chart(rows),
+        leaderboard=_table(keeps[:10], cols) or "<p class=muted>none yet</p>",
+        recent=_table(list(reversed(rows))[:14],
+                      [("val_bpb", "val_bpb"), ("status", "status"), ("slot", "branch"),
+                       ("description", "description")]),
+        findings=html.escape(findings),
+    )
+
+
+def cmd_dashboard(a) -> None:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            try:
+                body = _render_page().encode()
+            except Exception as e:  # never let a transient read crash the server
+                body = f"<pre>dashboard error: {html.escape(str(e))}</pre>".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):  # quiet
+            pass
+
+    url = f"http://127.0.0.1:{a.port}"
+    srv = HTTPServer(("127.0.0.1", a.port), Handler)
+    print(f"dashboard live at {url}  (Ctrl-C to stop; reads results.tsv + .vast_state.json live)")
+    if not a.no_open:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\ndashboard stopped.")
+
+
 # --- misc commands -------------------------------------------------------------
 
 def cmd_run(a) -> None:
@@ -645,6 +832,9 @@ def main() -> None:
     pp.add_argument("local")
     lp = add("log", cmd_log)
     lp.add_argument("fields", nargs="+", help="commit val_bpb memory_gb status branch description")
+    dp = add("dashboard", cmd_dashboard)
+    dp.add_argument("--port", type=int, default=8723)
+    dp.add_argument("--no-open", action="store_true", help="don't auto-open a browser")
     add("watchdog", cmd_watchdog)
     xp = add("extend", cmd_extend)
     xp.add_argument("--hours", type=float, default=2.0)

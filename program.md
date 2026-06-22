@@ -78,6 +78,11 @@ When the human says "let's kick off a new session", do this once, in order:
     Log it as the baseline (status `keep`), copy this `train.py` into the champion
     branch, and record the baseline `val_bpb` in `findings.md`. Now begin the loop.
 
+12. **(Optional) Offer the live dashboard.** Tell the human they can watch progress in a
+    browser: `python vast.py dashboard` (opens a localhost page that auto-refreshes
+    every 5s — val_bpb chart, leaderboard, recent runs, and the box's cost/deadline).
+    It reads the local `results.tsv` + `.vast_state.json`, so it updates as slots log.
+
 ---
 
 ## How parallelism works (orchestrator + slot subagents)

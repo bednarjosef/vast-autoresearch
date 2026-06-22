@@ -43,8 +43,9 @@ When the human says "let's kick off a new session", do this once, in order:
    python vast.py watchdog        # run in background
    ```
 
-6. **Prepare the box** (uploads the repo, builds the venv with cu128 torch, downloads
-   data + trains the tokenizer, detects GPU/CPU topology). Slow (~few min), one-time:
+6. **Prepare the box** (uploads the repo, uses the template's **preinstalled** torch and
+   installs only the light deps — no multi-GB torch download — then downloads data +
+   trains the tokenizer and detects GPU/CPU topology). One-time:
    ```
    python vast.py setup
    ```

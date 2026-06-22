@@ -68,14 +68,16 @@ STATE = REPO / ".vast_state.json"
 REMOTE_DIR = "/root/auto"
 RESULTS = REPO / "results.tsv"
 
-# Use the proven "PyTorch (Vast)" template purely for a fast-booting image that has
-# CUDA + python + a working sshd. We do NOT use its torch — `uv sync` builds a fresh
-# .venv with the cu128 torch this repo pins. Override with --image if you prefer.
+# Use the proven "PyTorch (Vast)" template: it ships a cached image with CUDA + python
+# + a working sshd AND torch preinstalled at /venv/main. We RUN that torch directly
+# (no multi-GB torch download per box) and only pip-install the few light deps this
+# repo adds. `uv sync` is a fallback only if the template torch is somehow unusable.
 TEMPLATE_HASH = "a33b72bd045341cfcd678ce7c932a614"  # PyTorch (Vast)
+DEFAULT_REMOTE_PY = "/venv/main/bin/python"          # the template's torch interpreter
 DEFAULT_GPU = "RTX_4090"
 
 # Offer filter (applied in Python on the raw JSON, robust to query syntax).
-MIN_CUDA = 12.8          # cu128 torch needs a host driver supporting CUDA 12.8
+MIN_CUDA = 12.1          # template torch is cu12x; host driver must support >= 12.1
 MIN_RELIABILITY = 0.98
 MIN_INET_DOWN = 300      # Mbit/s — HF data + torch wheels download fast
 MIN_DLPERF = 110         # avoid throttled/junk hosts (a real 4090 is ~150)
@@ -261,7 +263,7 @@ def cmd_up(a) -> None:
         "gpu": best["gpu_name"], "num_gpus": best.get("num_gpus", a.gpus),
         "cpu_cores": int(best.get("cpu_cores_effective") or best.get("cpu_cores", 0)),
         "created_at": now, "deadline": now + a.hours * 3600,
-        "host": None, "port": None, "ready": False,
+        "host": None, "port": None, "ready": False, "remote_py": DEFAULT_REMOTE_PY,
     })
     print(f"created instance {iid} at ${best['dph_total']:.3f}/hr "
           f"({best.get('num_gpus', a.gpus)} GPUs); auto-destroy deadline in {a.hours}h.")
@@ -333,26 +335,35 @@ def cmd_sync(a) -> None:
 
 SETUP_SCRIPT = r"""
 set -e
-export PATH="$HOME/.local/bin:/venv/main/bin:$PATH"
-export HF_HUB_ENABLE_HF_TRANSFER=0
 cd {REMOTE_DIR}
+export HF_HUB_DISABLE_PROGRESS_BARS=1
+TPY=/venv/main/bin/python
 
-echo "=== ensure uv ==="
-if ! command -v uv >/dev/null 2>&1; then
-  pip install -q uv 2>/dev/null || (curl -LsSf https://astral.sh/uv/install.sh | sh)
+# Prefer the template's PREINSTALLED torch -> no multi-GB torch download per box.
+# Require CUDA + torch>=2.4 + F.rms_norm (train.py needs it); else fall back to uv.
+if [ -x "$TPY" ] && "$TPY" -c "import torch,sys; from torch.nn.functional import rms_norm; sys.exit(0 if torch.cuda.is_available() and tuple(map(int,torch.__version__.split('.')[:2]))>=(2,4) else 1)" 2>/dev/null; then
+  PY="$TPY"
+  echo "=== using template torch (no download) ==="
+  "$PY" -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'on', torch.cuda.get_device_name(0))"
+  echo "=== installing light deps only (torch already present) ==="
+  "$PY" -m pip install -q --no-input "kernels>=0.11.7" rustbpe tiktoken pyarrow requests "numpy>=1.26"
+else
+  echo "=== template torch unusable -> building .venv with uv (downloads torch) ==="
+  export PATH="$HOME/.local/bin:$PATH"
+  command -v uv >/dev/null 2>&1 || pip install -q uv
+  uv sync
+  PY={REMOTE_DIR}/.venv/bin/python
 fi
-export PATH="$HOME/.local/bin:$PATH"
+echo "REMOTE_PY=$PY"
 
-echo "=== uv sync (builds .venv with the repo's cu128 torch) ==="
-uv sync
+echo "=== FA3 kernel smoke (validates the torch<->kernel match; small download) ==="
+"$PY" -c "import torch; from kernels import get_kernel; cap=torch.cuda.get_device_capability(); repo='varunneal/flash-attention-3' if cap==(9,0) else 'kernels-community/flash-attn3'; get_kernel(repo).flash_attn_interface; print('FA3 OK from', repo)"
 
-echo "=== prepare.py (download shards + train tokenizer; idempotent) ==="
-uv run prepare.py --num-shards {NUM_SHARDS}
+echo "=== prepare.py (download shards + train tokenizer; idempotent, cached) ==="
+"$PY" prepare.py --num-shards {NUM_SHARDS}
 
-echo "=== topology ==="
 echo "GPU_COUNT=$(nvidia-smi -L | wc -l)"
 echo "CPU_COUNT=$(nproc)"
-uv run python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'ok', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 echo "=== setup complete ==="
 """
 
@@ -365,17 +376,28 @@ def cmd_setup(a) -> None:
     p = subprocess.run(ssh_base(s) + [script])
     if p.returncode != 0:
         sys.exit("setup failed; see output above")
-    # Re-detect real GPU/CPU counts from the box (offer metadata can be approximate).
-    out = ssh_run(s, "echo GPU=$(nvidia-smi -L | wc -l) CPU=$(nproc)").stdout
-    gm = re.search(r"GPU=(\d+)", out)
-    cm = re.search(r"CPU=(\d+)", out)
+    # Detect which python to run experiments with (template torch vs uv fallback) and
+    # the real GPU/CPU topology from the box (offer metadata can be approximate).
+    detect = ssh_run(s, (
+        f'if [ -x {DEFAULT_REMOTE_PY} ] && {DEFAULT_REMOTE_PY} -c '
+        '"import torch,sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; '
+        f'then echo PY={DEFAULT_REMOTE_PY}; '
+        f'elif [ -x {REMOTE_DIR}/.venv/bin/python ]; then echo PY={REMOTE_DIR}/.venv/bin/python; fi; '
+        'echo GPU=$(nvidia-smi -L | wc -l) CPU=$(nproc)')).stdout
+    pym = re.search(r"PY=(\S+)", detect)
+    gm = re.search(r"GPU=(\d+)", detect)
+    cm = re.search(r"CPU=(\d+)", detect)
+    if pym:
+        s["remote_py"] = pym.group(1)
     if gm:
         s["num_gpus"] = int(gm.group(1))
     if cm:
         s["cpu_cores"] = int(cm.group(1))
     s["ready"] = True
     save_state(s)
-    print(f"\ntopology: {s['num_gpus']} GPUs, {s['cpu_cores']} CPU cores "
+    print(f"\nremote python: {s.get('remote_py', DEFAULT_REMOTE_PY)}  "
+          f"({'template torch — no download' if s.get('remote_py') == DEFAULT_REMOTE_PY else 'uv .venv'})")
+    print(f"topology: {s['num_gpus']} GPUs, {s['cpu_cores']} CPU cores "
           f"=> {slot_cores(s, 0)[0]} cores/slot")
     print("slots:", ", ".join(f"slot{i}->gpu{i} (cores {slot_cores(s, i)[1]})"
                               for i in range(s["num_gpus"])))
@@ -408,10 +430,11 @@ def _train_invocation(s: dict, slot: int, script: str, cache_dir: str | None = N
     runs (warm starts → less startup overhead, and a fast bench)."""
     cps, cores = slot_cores(s, slot)
     gpu = slot  # slot N -> GPU N
+    py = s.get("remote_py", DEFAULT_REMOTE_PY)  # template torch by default; uv .venv fallback
     cache = f"TORCHINDUCTOR_CACHE_DIR={cache_dir} " if cache_dir else ""
     return (f"taskset -c {cores} env CUDA_VISIBLE_DEVICES={gpu} OMP_NUM_THREADS={cps} "
             f"OPENBLAS_NUM_THREADS={cps} PYTHONPATH={REMOTE_DIR} {cache}"
-            f"{REMOTE_DIR}/.venv/bin/python {script}")
+            f"{py} {script}")
 
 
 def cmd_exp(a) -> None:

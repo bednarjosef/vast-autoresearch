@@ -66,7 +66,7 @@ long you want to run, then drive `vast.py`:
 ```bash
 python vast.py up --gpus 4 --hours 3 --max-price 0.60   # cheapest qualifying box ($/GPU/hr cap)
 python vast.py watchdog &                               # auto-destroy at the deadline (safety)
-python vast.py setup                                    # venv + data + tokenizer + topology
+python vast.py setup                                    # template torch + light deps + data + topology (no torch download)
 python vast.py bench                                    # confirm GPUs are equivalent + measure contention
 python vast.py exp --slot 0 --train train.py            # run one experiment on GPU 0
 python vast.py dashboard                                # live browser view of progress (see below)

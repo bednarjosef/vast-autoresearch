@@ -49,12 +49,41 @@ Hi have a look at program.md and let's kick off a new experiment! let's do the s
 
 The `program.md` file is essentially a super lightweight "skill".
 
+## Running on Vast.ai (this fork)
+
+This fork adds **`vast.py`** so you can run the whole thing from a laptop with **no
+local GPU**. The agents and the research loop stay on your machine; only the GPU work
+(`train.py`, the 5-minute budget) runs on **one rented Vast.ai box per session** with
+several GPUs, so a pool of subagents can run experiments **in parallel** — one per GPU,
+each pinned to its own GPU + CPU cores so they never interfere — while sharing a single
+ledger (`results.tsv`) and knowledge log (`findings.md`).
+
+**One-time:** `vastai set api-key <KEY>` (an ssh key is auto-created/registered).
+
+**Each session,** just tell your agent to read `program.md` and start — it will ask how
+long you want to run, then drive `vast.py`:
+
+```bash
+python vast.py up --gpus 4 --hours 3 --max-price 0.60   # cheapest qualifying box ($/GPU/hr cap)
+python vast.py watchdog &                               # auto-destroy at the deadline (safety)
+python vast.py setup                                    # venv + data + tokenizer + topology
+python vast.py bench                                    # confirm GPUs are equivalent + measure contention
+python vast.py exp --slot 0 --train train.py            # run one experiment on GPU 0
+python vast.py down                                     # destroy the box + clear state
+```
+
+Safety is built in: exactly one tracked box at a time with a hard auto-destroy
+deadline, a background `watchdog`, and `ps`/`nuke` to catch orphans. Run
+`python vast.py --help` for all commands. At ~$0.34/GPU/hr for 4090s, a 3-hour 4-GPU
+session is roughly $4.
+
 ## Project structure
 
 ```
 prepare.py      — constants, data prep + runtime utilities (do not modify)
 train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
+program.md      — agent instructions (Vast + parallel orchestration)
+vast.py         — Vast.ai control plane (rent/setup/bench/run/teardown)
 pyproject.toml  — dependencies
 ```
 

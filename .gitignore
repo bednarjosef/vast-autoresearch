@@ -21,3 +21,8 @@ dev/
 
 # Results file
 results.tsv
+
+# Vast session state (per-session; never commit)
+.vast_state*.json
+bench.json
+findings.md

@@ -121,8 +121,24 @@ Each round, in order:
    *guarantee* them — for a collision-prone idea, or any slot that strayed last round,
    **don't name the idea, specify the exact code/diff** so there's nothing to substitute.
 
-3. **Keep a "Tried" registry in `findings.md`** so nothing repeats across rounds. Read it
-   before assigning; never re-assign anything already on it.
+   **BREADTH, NOT TUNNEL VISION — the rule most often broken.** A round of N slots covers N
+   *different* axes. **Never put two slots on the same idea or close variants** — e.g. "tune
+   flooding `b`", "per-sequence flooding", and "find the perfect flooding value" are ONE idea
+   family, so that's at most ONE slot, never four. And **never spend consecutive rounds
+   circling one discovery.** The moment an idea is confirmed and banked into the champion
+   (step 5) it is **DONE**: it moves to the **Banked** list and is OFF the menu — stop
+   assigning slots to perfect it. Chasing the "ideal" value of an already-good hyperparameter
+   (3 vs 3.25 vs 3.5) is diminishing-returns busywork: do it **once**, as a single sweep on
+   **one** slot, bank the best value, and spend every other slot on **axes you have NOT
+   explored yet**. Your job is to keep finding NOVEL wins on top of the champion — not to
+   polish one. Each round, glance at the coverage in `findings.md` and prioritize the
+   **least-explored** axes; if you catch yourself assigning >1 slot to the current hot idea,
+   stop and re-diversify.
+
+3. **Keep a "Tried" registry AND a "Banked" list in `findings.md`.** Tried = every idea
+   attempted (so nothing repeats); Banked = wins already folded into the champion (so they're
+   never re-explored). Read both before assigning; **never re-assign anything on either list**,
+   and never assign a close variant of a Banked idea.
 
 4. **Spawn N subagents in ONE message — FOREGROUND, concurrent — and wait for the batch.**
    Use the Agent tool: one subagent per slot, the prompt below filled in, all in a single
@@ -143,9 +159,14 @@ Each round, in order:
      the ledger, discard the violating/duplicate runs**, and next round hand that slot a
      **fully-specified diff, not a menu**.
    - **You are the sole writer of `findings.md`.** Update it every round from the reconciled
-     results (Champion + Tried + Dead ends). Subagents never touch it (no clobbering).
+     results (Champion + Tried + **Banked** + Dead ends). Subagents never touch it.
    - **Confirm before counting a win.** Gains can be noise — re-run a promising delta once;
      if it holds, it's real.
+   - **Bank a win, then LEAVE IT ALONE.** The moment a win is folded into the champion, add it
+     to the **Banked** list and stop assigning slots to it. At most ONE follow-up may fine-tune
+     its hyperparameter — a single sweep on one slot — after which the value is frozen.
+     Re-spending slots to "perfect" a banked idea (sweeping its value, per-token/per-seq
+     variants, etc.) is the #1 way the loop stalls. Keep what worked; go find the NEXT new win.
    - **Compound: find A, find B, then TEST A+B and adopt the best as the new base.** When two
      (or more) confirmed wins land — especially on different axes, which usually compose —
      build the combination on top of the champion and **run it** (`exp` on the merged

@@ -72,7 +72,11 @@ Each round, in order:
    write down: its single axis, the **concrete idea(s) it owns this round** (one if it's a
    1-experiment round, two if a 2-experiment round), and an explicit **OFF-LIMITS list** =
    every other slot's axis + ideas. With N slots, give the first N distinct axes;
-   **rotate axes across rounds** so each slot sees variety.
+   **rotate axes across rounds** so each slot sees variety. The off-limits list reduces
+   collisions but doesn't *guarantee* them — subagents sometimes reach for the "obvious"
+   first idea regardless — so for a collision-prone idea (or any slot that strayed last
+   round), **don't name the idea, specify the exact change** (the code/diff) so there's
+   nothing to substitute. Compliance is verified on return (step 5).
 
 3. **Keep a "Tried" registry in `findings.md` so nothing repeats across rounds.** Every
    concrete idea ever attempted (+ its result) goes on the list. Before assigning a round,
@@ -85,9 +89,22 @@ Each round, in order:
    optimizer, attention, normalization, init"). Fold what you learn into the next round's
    per-slot directions.
 
-5. **When they return, STACK the genuine wins and keep compounding.** Read their
-   summaries, update `findings.md` (incl. the Tried registry). The champion should grow by
-   accumulating every *real* improvement, not by replacing one good idea with another:
+5. **When they return, VERIFY, then STACK the genuine wins.** Read their summaries, but
+   reconcile against ground truth before trusting anything — then update `findings.md`
+   yourself. The champion grows by accumulating every *real* improvement, not by replacing
+   one good idea with another:
+   - **The ledger is ground truth; verify compliance.** `results.tsv` (and each slot's git
+     commits/diff) is authoritative — a subagent's self-report can be wrong or incomplete: a
+     slot may have run more than {k} experiments, strayed outside its axis, or — worst —
+     duplicated another slot's idea (this happens even with an explicit off-limits list).
+     Reconcile every reported result against `results.tsv` and the slot's commits. If a slot
+     exceeded {k}, went off-axis, or overlapped another slot, **treat the ledger as truth,
+     discard the violating/duplicate runs**, and tighten that slot next round — hand it a
+     **fully-specified change (exact code/diff), not a menu**, so there's nothing left to
+     substitute.
+   - **You are the sole writer of `findings.md`.** Update it every round, right here, from
+     the reconciled results (Champion + Tried + Dead ends). Subagents never touch it, so it
+     stays clean and race-free.
    - **Confirm before counting it.** A "win" is only genuine if it survives a re-run on the
      same slot (gains in this regime can be noise). Re-run a promising delta once; if it
      holds, it's real.
@@ -131,18 +148,23 @@ Each round, in order:
 >      VRAM — log it `crash`, `git reset --hard HEAD~1`, and DON'T retry it bigger. (If you
 >      must keep the idea, the only fix is a smaller `DEVICE_BATCH_SIZE` — but that's Axis D,
 >      not yours, so just report it and move on.)
-> 4. Log it: `python vast.py log <commit> <val_bpb> <mem_gb> <keep|discard|crash>
->    slot{i} "<description>"` (atomic — safe under concurrency).
+> 4. Log it to the ledger: `python vast.py log <commit> <val_bpb> <mem_gb>
+>    <keep|discard|crash> slot{i} "<description>"` (atomic — safe under concurrency). This
+>    `results.tsv` ledger is the ground-truth record and the ONLY shared file you write.
 > 5. If `val_bpb` improved, keep the commit. If equal/worse/failed,
 >    `git -C worktrees/slot{i} reset --hard HEAD~1`.
-> 6. Append a one-line note to `findings.md` (what you tried + the result).
 >
-> Stay on your slot/worktree/branch only — never touch another slot's GPU, worktree, or
-> branch, and never run a 3rd experiment. When done, return a short summary: your best
-> `val_bpb`, the winning idea, and which idea flopped (so it goes on the Tried list).
+> Do **NOT** edit `findings.md` — the orchestrator is its sole writer (it curates it from
+> your returned summary; this prevents concurrent-write clobbering). Stay on your
+> slot/worktree/branch only — never touch another slot's GPU, worktree, or branch, and never
+> run more than {k} experiments. When done, **return a structured summary**: for each
+> experiment — the exact one-line diff you made (so the orchestrator can verify it stayed in
+> axis {axis}), its commit hash, `val_bpb` / `peak_vram` (or the CRASH/OOM/TIMEOUT reason),
+> and whether to keep it or put it on the Tried list.
 
 This keeps slots **non-interfering** (distinct GPU + CPU cores + worktree + branch +
-remote dir) yet **interconnected** (shared `findings.md` + ledger + one champion).
+remote dir) yet **interconnected** (the shared `results.tsv` ledger they write + the
+orchestrator-curated `findings.md` digest they read + one champion they all build from).
 
 ---
 
@@ -169,7 +191,8 @@ When the human says "let's kick off a new session", do this once, in order:
 9. **One worktree + branch per slot**:
    `for i in 0..N-1: git worktree add worktrees/slot$i -b autoresearch/<tag>-slot$i`.
 10. **Initialize shared state** (both untracked/gitignored): `results.tsv` (auto-created by
-    `vast.py log`) and `findings.md` with two sections: **Champion** and **Tried** (seed
+    `vast.py log`; the append-only ledger the subagents write) and `findings.md`
+    (**orchestrator-owned**; seed sections **Champion**, **Tried**, **Dead ends** with
     "baseline pending").
 11. **Establish the baseline AND confirm it fits VRAM.** Run the unmodified `train.py` on
     slot 0: `python vast.py exp --slot 0 --train train.py`.
@@ -240,10 +263,14 @@ can be noisy.
 
 ## Sharing findings
 
-`findings.md` is the swarm's shared brain. Keep current: **Champion** (val_bpb + the
-one-line change that achieved it), **Tried** (every idea + result, so nothing repeats),
-and **Dead ends** (consistently-failing ideas). Give subagents the latest digest each
-round; fold their summaries back in after.
+`findings.md` is the swarm's shared brain, and **the orchestrator is its sole writer.**
+Subagents return summaries and log raw runs to the `results.tsv` ledger; only you edit
+`findings.md`, so it never gets clobbered by concurrent appends and stays a curated record
+rather than a pile of overlapping notes. **Update it every round, immediately after you
+evaluate the handed-back results** (reconciled against `results.tsv`). Keep three sections
+current: **Champion** (val_bpb + the one-line change that achieved it), **Tried** (every
+idea + result, so nothing repeats), and **Dead ends** (consistently-failing ideas). Give
+subagents the latest digest each round.
 
 ---
 

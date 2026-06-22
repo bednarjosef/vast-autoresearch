@@ -1,8 +1,9 @@
 # autoresearch — session start
 
 This is a general **autonomous research swarm**: an orchestrator rents a multi-GPU box and
-runs a pool of parallel subagents that mutate one **experiment artifact** to improve a
-**measured objective**, compounding wins over a session. **It can research almost anything**
+runs a pool of parallel experiments (one per GPU) that each test a mutation of one
+**experiment artifact** to improve a **measured objective**, compounding wins over a session.
+**It can research almost anything**
 that fits a simple contract (below) — optimizing an ML model, an algorithm, a GPU kernel, a
 solver, a prompt, a trading rule, a compression scheme, a config… **LLM pretraining is just
 the default instantiation that ships in the repo** (`train.py` + `prepare.py`, objective
@@ -11,15 +12,15 @@ the default instantiation that ships in the repo** (`train.py` + `prepare.py`, o
 Two docs drive a session:
 - **`program.md`** — the **mission & config** (what to optimize, the metric, the knobs, the
   axes). Editable by you and the human.
-- **`ENGINE.md`** — the **fixed engine** (how the orchestrator + subagents run). **Never edit it.**
+- **`ENGINE.md`** — the **fixed engine** (how the orchestrator runs the loop). **Never edit it.**
 
 The roles (the LLM default in parentheses):
-- **The experiment** (`train.py`) — the one artifact the swarm edits; running it prints a
+- **The experiment** (`train.py`) — the one artifact the orchestrator edits; running it prints a
   `OBJECTIVE: <number>` line.
 - **The harness** (`prepare.py`) — the **frozen** task/data/evaluator that computes the
   objective honestly, so the score can't be gamed.
 - **The objective** — a metric name + direction, set via `vast.py start --metric NAME --goal min|max`.
-- **The axes** — disjoint families of edits to the experiment (so subagents never overlap).
+- **The axes** — disjoint families of edits to the experiment (so parallel slots never overlap).
 
 At the **start of every session**, do ONE of the following:
 
@@ -75,8 +76,9 @@ else, say you'll get them set up first), **run onboarding**:
 
 No marker → the mission is set. Read `program.md` + `ENGINE.md`, then do what the user asked.
 To start a session, follow `ENGINE.md`: `python vast.py start --metric … --goal … …`, then
-**spawn one subagent per GPU slot** (you orchestrate — you never run experiments yourself) and
-run the round loop.
+run the round loop — each round **you edit every slot's `train.py` and run them all in parallel
+with `python vast.py round`** (the orchestrator runs the experiments itself, one per GPU),
+alongside one research-scout subagent.
 
 ---
 

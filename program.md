@@ -7,7 +7,7 @@
 # Mission & config — EDIT THIS FILE
 
 This is the **editable** part of autoresearch: **what** to research, **how** to score it,
-and the **knobs**. The fixed machinery (how the orchestrator + subagents actually run) is in
+and the **knobs**. The fixed machinery (how the orchestrator actually runs the loop) is in
 [`ENGINE.md`](ENGINE.md) — **do not edit that one.** When the human starts a session, read
 this file, then run the loop in `ENGINE.md`.
 
@@ -66,7 +66,7 @@ One-shot bring-up: `python vast.py start --metric val_bpb --goal min --gpus 4 --
 
 ## 4. The search axes  ← edit for your research focus
 
-The orchestrator gives each slot a **disjoint axis** each round so subagents never overlap
+The orchestrator gives each slot a **disjoint axis** each round so slots never overlap
 (see `ENGINE.md`). Partition by **which component of `train.py` a change touches** — each
 idea belongs to exactly one axis, so distinct axes can't collide:
 
@@ -93,12 +93,12 @@ The boundary is **temporal**, and it's what keeps the score honest:
 - **Before research (setup / onboarding):** the human and their agent may edit anything to
   configure the study — `program.md`, `train.py`, and even **`prepare.py`** (the regime,
   data, tokenizer, `TRAIN_TOKENS`, …). Set it up however you like, then launch.
-- **During research (the round loop):** **only `train.py` may change.** The orchestrator and
-  the subagents must NOT touch `prepare.py`, `evaluate_bpb`, the `forward`→logits contract,
+- **During research (the round loop):** **only `train.py` may change.** The orchestrator
+  must NOT touch `prepare.py`, `evaluate_bpb`, the `forward`→logits contract,
   or [`ENGINE.md`](ENGINE.md). Every gain must come from `train.py` alone, so the metric
-  can't be gamed. This is enforced structurally: `vast.py exp` uploads **only** `train.py`,
-  so the box keeps the `prepare.py`/metric frozen at setup no matter what — a subagent
-  editing `prepare.py` locally simply has no effect on its score.
+  can't be gamed. This is enforced structurally: `vast.py exp`/`round` upload **only** each
+  slot's `train.py`, so the box keeps the `prepare.py`/metric frozen at setup no matter what —
+  editing `prepare.py` locally simply has no effect on the score.
 - **Keep the time-budget + eval scaffolding in `train.py`** when editing it: the
   `start_training_clock()` call, the `try … except TrainingTimeUp` around the training loop,
   and the final `evaluate_bpb` + `val_bpb:` print. They make every run hard-bounded to the
@@ -108,5 +108,6 @@ The boundary is **temporal**, and it's what keeps the score honest:
 ---
 
 **To run:** the orchestrator follows [`ENGINE.md`](ENGINE.md) — bring up the box with
-`vast.py start`, spawn one subagent per GPU slot (it must NOT run experiments itself), and
-loop. The whole control plane is `python vast.py --help`.
+`vast.py start`, then each round edit every slot's `train.py` and run them all in parallel with
+`python vast.py round` (the orchestrator runs the experiments itself), alongside one
+research-scout subagent, and loop. The whole control plane is `python vast.py --help`.

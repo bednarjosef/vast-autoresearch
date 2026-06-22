@@ -24,8 +24,8 @@ Typical session (what program.md drives the agent to do):
   vast.py watchdog &                   # background auto-destroy at the deadline
   vast.py setup                        # uv sync + prepare.py + detect GPUs/CPUs
   vast.py bench                        # confirm GPUs equivalent + measure contention
-  vast.py exp --slot 0 --train worktrees/slot0/train.py   # one experiment on GPU 0
-  ...                                  # subagents run many of these in parallel
+  vast.py exp --slot 0 --train worktrees/slot0/train.py   # one experiment on GPU 0 (baseline/re-test)
+  vast.py round                        # ALL slots in parallel (orchestrator runs a whole round)
   vast.py down                         # destroy + clear state (or let watchdog do it)
 
 Commands:
@@ -36,8 +36,9 @@ Commands:
   setup    sync + install uv + uv sync + prepare.py + detect GPU/CPU topology
   bench    solo + concurrent throughput per GPU (objectivity check)
   exp      --slot N --train PATH: run that train.py on GPU N, print val_bpb/vram
+  round    run every slot's train.py at once, in parallel across the GPUs (one whole round)
   run      run an arbitrary command in the remote repo dir
-  log      atomically append a row to local results.tsv (for parallel subagents)
+  log      atomically append a row to local results.tsv
   pull     download a file/dir back from the box
   watchdog loop; destroy at the recorded deadline (run in background)
   extend   push the deadline out
@@ -471,20 +472,13 @@ def _train_invocation(s: dict, slot: int, script: str, cache_dir: str | None = N
             f"{py} {script}")
 
 
-def cmd_exp(a) -> None:
-    """Run ONE experiment: push this slot's train.py to the box, run it on the
-    slot's GPU (CPU-pinned), and report val_bpb / peak_vram. Used by subagents."""
-    s = require_state()
-    if not s.get("ready"):
-        print("WARN: box not marked ready; run `vast.py setup` first.", file=sys.stderr)
-    if a.minutes:  # per-run budget override (default: the session's time_budget_s)
-        s = {**s, "time_budget_s": int(a.minutes * 60)}
-    slot = a.slot
-    if slot >= s["num_gpus"]:
-        sys.exit(f"slot {slot} out of range (box has {s['num_gpus']} GPUs)")
-    train = Path(a.train)
-    if not train.exists():
-        sys.exit(f"train file not found: {train}")
+def _exp_run(s: dict, slot: int, train: Path) -> dict:
+    """Run ONE experiment on `slot`'s GPU and return its result dict.
+
+    Shared by `exp` (one slot) and `round` (every slot in parallel): push this slot's
+    train.py to the box, run it on the slot's GPU (CPU-pinned), parse + print the result.
+    Thread-safe — each call is its own ssh/scp subprocesses — so `round` can map it across
+    slots concurrently, exactly like `bench`."""
     workdir = f"{REMOTE_DIR}/slots/slot{slot}"
     cache = f"{REMOTE_DIR}/.inductor/slot{slot}"  # per-slot compile cache (warm starts)
     ssh_run(s, f"mkdir -p {workdir} {cache}")
@@ -520,8 +514,83 @@ def cmd_exp(a) -> None:
         result = {"slot": slot, "ok": False, "reason": reason, "wall_seconds": round(dt, 1)}
         hint = "  (out of memory — shrink the run; treat as discard)" if oom else ""
         print(f"[slot{slot}] {reason} / no '{primary}'{hint}. tail:\n{r.stdout[-1500:]}")
+    return result
+
+
+def cmd_exp(a) -> None:
+    """Run ONE experiment on one slot and report val_bpb / peak_vram. Used for the
+    baseline run and one-off re-tests; the orchestrator runs whole rounds with `round`."""
+    s = require_state()
+    if not s.get("ready"):
+        print("WARN: box not marked ready; run `vast.py setup` first.", file=sys.stderr)
+    if a.minutes:  # per-run budget override (default: the session's time_budget_s)
+        s = {**s, "time_budget_s": int(a.minutes * 60)}
+    slot = a.slot
+    if slot >= s["num_gpus"]:
+        sys.exit(f"slot {slot} out of range (box has {s['num_gpus']} GPUs)")
+    train = Path(a.train)
+    if not train.exists():
+        sys.exit(f"train file not found: {train}")
+    result = _exp_run(s, slot, train)
     print("RESULT_JSON:" + json.dumps(result))
     sys.exit(0 if result["ok"] else 1)
+
+
+def cmd_round(a) -> None:
+    """Run a WHOLE round: every slot's train.py at once, in PARALLEL across the GPUs,
+    in ONE blocking call — then print all results. This is how the ORCHESTRATOR runs the
+    round itself (no per-experiment subagents): reset slots, edit each worktree's train.py,
+    commit, then call `round` once. Faithful parallelism: same GPU/CPU pinning as `exp`,
+    one thread per slot (like `bench`). Blocks until the slowest slot finishes."""
+    s = require_state()
+    if not s.get("ready"):
+        print("WARN: box not marked ready; run `vast.py setup` first.", file=sys.stderr)
+    if a.minutes:  # per-round budget override (default: the session's time_budget_s)
+        s = {**s, "time_budget_s": int(a.minutes * 60)}
+    G = s["num_gpus"]
+    slots = [int(x) for x in a.slots.split(",")] if a.slots else list(range(G))
+    overrides = {}
+    for spec in (a.train or []):  # --train SLOT=PATH (repeatable); default worktrees/slotN/train.py
+        k, _, v = spec.partition("=")
+        overrides[int(k)] = v
+    plan: dict[int, Path] = {}
+    for slot in slots:
+        if slot >= G:
+            sys.exit(f"slot {slot} out of range (box has {G} GPUs)")
+        train = Path(overrides.get(slot, f"worktrees/slot{slot}/train.py"))
+        if not train.exists():
+            sys.exit(f"train file not found for slot {slot}: {train}")
+        plan[slot] = train
+    budget_min = s.get("time_budget_s", 300) // 60
+    print(f"round: {len(plan)} experiments in parallel on slots {sorted(plan)} "
+          f"({budget_min} min each)…", flush=True)
+    items = list(plan.items())
+
+    def _safe(kv):
+        slot, train = kv
+        try:  # one slot's failure (e.g. a transient scp/ssh error) must not sink the round
+            return _exp_run(s, slot, train)
+        except Exception as e:  # noqa: BLE001 — report it as a failed slot, keep the others
+            print(f"[slot{slot}] ERROR: {e}")
+            return {"slot": slot, "ok": False, "reason": f"ERROR: {e}", "wall_seconds": 0.0}
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=len(items)) as ex:
+        out = list(ex.map(_safe, items))
+    results = {slot: res for (slot, _), res in zip(items, out)}
+    dt = time.time() - t0
+    print(f"\n=== round done in {dt:.0f}s ===")
+    for slot in sorted(results):
+        res = results[slot]
+        if res["ok"]:
+            vram = f"  vram={res['peak_vram_mb']/1024:.1f}GB" if "peak_vram_mb" in res else ""
+            print(f"  slot{slot}: {res['metric']}={res['score']:.6f}{vram}")
+        else:
+            print(f"  slot{slot}: {res.get('reason', 'FAIL')}")
+        print("RESULT_JSON:" + json.dumps(res))
+    print("ROUND_JSON:" + json.dumps({"wall_seconds": round(dt, 1),
+                                      "slots": {str(k): v for k, v in results.items()}}))
+    sys.exit(0 if all(r["ok"] for r in results.values()) else 1)
 
 
 # --- bench (objectivity) -------------------------------------------------------
@@ -831,8 +900,9 @@ def cmd_pull(a) -> None:
 
 
 def cmd_log(a) -> None:
-    """Atomically append one tab-separated row to results.tsv (parallel-safe).
-    Subagents call this so concurrent writes never interleave/corrupt the ledger."""
+    """Atomically append one tab-separated row to results.tsv (file-locked, so even
+    concurrent writes never interleave/corrupt the ledger). The orchestrator logs one
+    row per experiment after a round."""
     import fcntl
     row = "\t".join(a.fields)
     if not RESULTS.exists():
@@ -945,6 +1015,14 @@ def main() -> None:
     ep.add_argument("--train", required=True, help="path to the train.py to run")
     ep.add_argument("--minutes", type=float, default=None,
                     help="override this run's training budget (default: the session's)")
+    rdp = add("round", cmd_round)
+    rdp.add_argument("--slots", default=None,
+                     help="comma list of slots to run (default: all GPUs)")
+    rdp.add_argument("--train", action="append", default=None,
+                     help="override a slot's train path as SLOT=PATH "
+                          "(default worktrees/slotN/train.py); repeatable")
+    rdp.add_argument("--minutes", type=float, default=None,
+                     help="override this round's per-experiment budget (default: the session's)")
     rpz = add("reap", cmd_reap)
     rpz.add_argument("--slot", type=int, default=None, help="only this slot (default: all)")
     rp = add("run", cmd_run)

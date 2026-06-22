@@ -1,9 +1,9 @@
 # autoresearch
 
 An autonomous research swarm you drive from a laptop with **no local GPU**. You tell it what
-to optimize; it rents a multi-GPU box on [Vast.ai](https://vast.ai), spawns a pool of AI
-subagents that mutate one **experiment** file in parallel — each on its own GPU — and compounds
-their wins into a steadily-improving result. Findings are grounded in the literature via the
+to optimize; it rents a multi-GPU box on [Vast.ai](https://vast.ai), then the orchestrator
+mutates one **experiment** file and runs a pool of experiments in parallel — each on its own
+GPU — and compounds their wins into a steadily-improving result. Findings are grounded in the literature via the
 `research` skill, progress is visible in a live dashboard, and the box tears itself down at a
 hard deadline so you can leave it running overnight.
 
@@ -23,12 +23,13 @@ The default training core is a single-file GPT (Muon + AdamW), forked from
 
 - **You** pick the goal (lowest `val_bpb`, a better optimizer, a loss that generalizes, …),
   the per-experiment training budget, and how long the session runs.
-- **The orchestrator** (the main agent) rents one Vast box with N GPUs and, each round, hands
-  every GPU slot a **disjoint research direction** so no two subagents try the same thing.
-- **N subagents** run in parallel — one per GPU — each editing `train.py`, running it, and
-  reporting back. Every experiment is `train.py` trained for a fixed budget; the score is
+- **The orchestrator** (the main agent) rents one Vast box with N GPUs and, each round, gives
+  every GPU slot a **disjoint research direction** so no two slots try the same thing.
+- **The orchestrator runs the experiments itself.** Each round it edits every slot's `train.py`,
+  then `vast.py round` runs all N at once — one per GPU, in parallel — and reports each result.
+  Every experiment is `train.py` trained for a fixed budget; the score is
   **`val_bpb`** (held-out bits-per-byte, lower = better, vocab-independent so changes compare
-  fairly).
+  fairly). A single **research-scout** subagent mines the literature concurrently during the run.
 - **Wins compound.** The orchestrator verifies improvements, **stacks** them (and tests
   combinations), and makes the result the new champion — every round builds *upon* the best so
   far instead of starting from scratch. `val_bpb` keeps dropping across the whole session.
@@ -42,7 +43,7 @@ so the score can't be gamed — gains must come from `train.py` alone.
 |------|------|
 | **`CLAUDE.md`** | Session-start router. On a fresh clone it **onboards you** (asks what to research) and tailors `program.md`. |
 | **`program.md`** | The **mission & config** you edit: what to optimize, the metric, the knobs, the search axes. |
-| **`ENGINE.md`** | The **fixed engine**: how the orchestrator + subagents run a session. Not edited. |
+| **`ENGINE.md`** | The **fixed engine**: how the orchestrator runs a session. Not edited. |
 | **`train.py`** | The research target — the only file edited *during* research. |
 | **`prepare.py`** | Data, tokenizer, regime, and the `evaluate_bpb` metric. Frozen during research. |
 | **`vast.py`** | The control plane (rent / setup / bench / run / dashboard / teardown). |
@@ -88,9 +89,9 @@ Every round the orchestrator leans on it to:
 - check whether an idea is already known to work (or to fail), before spending a GPU on it,
 - ground each slot's assigned direction in the literature rather than guesswork.
 
-To keep the GPUs busy while it reads, a **"research scout" subagent** joins the same
-foreground batch as the experiment subagents — so literature mining happens *concurrently*
-with training, and fresh ideas arrive with the fresh numbers. It scans **abstracts first**
+Because `vast.py round` blocks the orchestrator while the GPUs train, a **"research scout"
+subagent** is dispatched in the same message as the round — so literature mining happens
+*concurrently* with training, and fresh ideas arrive with the fresh numbers. It scans **abstracts first**
 (cheap) and only fetches full text for the most promising leads. `ENGINE.md` explicitly
 directs the agent to use the skill for ideation, SOTA-hunting, and verification — not to rely
 on what it already knows.
@@ -102,7 +103,8 @@ on what it already knows.
 | Command | What it does |
 |---------|--------------|
 | `start` | One-shot bring-up: rent → watchdog → setup → bench. |
-| `exp --slot N --train F` | Run one experiment on GPU `N` (subagents call this; foreground/blocking). |
+| `exp --slot N --train F` | Run one experiment on GPU `N` (baseline / re-test; foreground/blocking). |
+| `round` | Run every slot's `train.py` at once, in parallel across the GPUs (one whole round; foreground/blocking). |
 | `bench` | ~1-min objectivity check: confirms GPUs are equivalent, measures contention. |
 | `dashboard` | Live browser view (chart, leaderboard, cost, deadline). |
 | `reap` | Kill stray/ghost runs; show what's on each GPU. |

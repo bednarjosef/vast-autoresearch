@@ -99,6 +99,14 @@ strictly improving by building UPON itself.
 - **1 each** for tight steering (early calibration, risky ideas, or little time left).
 - **2 each** to go deeper on a promising axis (idea + a natural follow-up in one dispatch).
 
+> **USE THE `research` SKILL — every round, not from memory.** Before assigning directions,
+> mine the literature with the **`research` skill** (scholarly + web): find genuinely **novel
+> ideas**, the **current SOTA** for whatever you're optimizing, and evidence on whether an idea
+> is known to work or to fail (so you don't burn a GPU rediscovering it). Ground each slot's
+> direction in what you find. The cheapest way to do this without idling is to spawn a
+> **research-scout subagent in the same foreground batch** as the experiments (step 4). Lean on
+> the skill hard — it is your primary source of ideas, not your prior knowledge.
+
 Each round, in order:
 
 1. **Pick the champion** = lowest `val_bpb` so far (its `train.py` is on `autoresearch/<tag>`).
